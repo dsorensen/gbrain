@@ -7,10 +7,11 @@ March, an idea you jotted down late one night. GBrain finds it. And it knows
 the connections — who attended that meeting, who that paper's author has
 invested in, what other ideas in your brain it overlaps with.
 
-On the standard public benchmark for AI memory systems, the right answer
-lands in gbrain's top 5 results **97.6% of the time**. Better than every
-comparable system that doesn't pay for a language-model call on every
-retrieval, at $0.50 per thousand queries.
+On [LongMemEval](https://huggingface.co/datasets/xiaowu0162/longmemeval),
+the public benchmark for AI memory systems, the right answer lands in
+gbrain's top 5 results **97.6% of the time**. Better than every comparable
+system that doesn't pay for a language-model call on every retrieval, at
+$0.50 per thousand queries.
 
 For relational questions ("who works at this company?", "what did this
 founder invest in this quarter?"), gbrain's self-wiring knowledge graph
@@ -21,8 +22,8 @@ creates typed edges (`works_at`, `attended`, `invested_in`, `founded`,
 
 [Receipts on the evals →](#receipts-on-the-evals)
 
-Built by the President and CEO of Y Combinator to run his own AI agents. The
-production brain powering Garry's OpenClaw and Hermes deployments has grown
+I'm the President and CEO of Y Combinator, and I use this 16 hours a day.
+The production brain powering my OpenClaw and Hermes deployments has grown
 into the largest documented personal-AI knowledge graph in active use:
 
 | | |
@@ -46,7 +47,7 @@ flags trajectory regressions. You wake up and the brain is smarter than when
 you went to bed.
 
 GBrain is those patterns, generalized. **Install in 30 minutes. Your agent
-does the work.** As Garry's personal agent gets smarter, so does yours.
+does the work.** As my personal agent gets smarter, so does yours.
 
 > Database ready in 2 seconds (PGLite, no server). Full eval scorecards,
 > reproduction instructions, cross-system comparisons, and the
@@ -509,12 +510,12 @@ Run `gbrain <command> --help` for per-command options.
 
 ## Origin story
 
-Garry Tan needed a brain that could remember every meeting, every founder
-encounter, every essay he'd ever drafted, every idea he wanted to chase
+I needed a brain that could remember every meeting, every founder
+encounter, every essay I'd ever drafted, every idea I wanted to chase
 later. Off-the-shelf knowledge tools (Roam, Obsidian, Notion) handle
 storage. None of them ingest a meeting, enrich the attendees, build the
 graph, fix the citations, and surface the connection three weeks later
-when it matters. So he built one. The first 12 days produced a working
+when it matters. So I built one. The first 12 days produced a working
 brain. The next 12 months produced 100,000 pages, a self-wiring knowledge
 graph, 108 cron jobs, and the multi-engine architecture that ships here.
 
