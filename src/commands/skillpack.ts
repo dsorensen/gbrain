@@ -83,6 +83,8 @@ Subcommands:
                              default; --minimal opts out of test/e2e/evals).
   pack [<pack-dir>]          Run doctor then emit a deterministic
                              <name>-<version>.tgz tarball with SHA-256.
+  endorse <name>             (Operator-only) Set the tier for a pack in
+                             endorsements.json inside a registry repo clone.
 
 Run \`gbrain skillpack <subcommand> --help\` for per-subcommand options.
 
@@ -141,6 +143,9 @@ export async function runSkillpack(args: string[]): Promise<void> {
       return;
     case 'pack':
       await cmdPack(rest);
+      return;
+    case 'endorse':
+      await cmdEndorse(rest);
       return;
     case 'install':
       console.error(
@@ -1162,6 +1167,87 @@ async function cmdPack(args: string[]): Promise<void> {
   } catch (err) {
     if (err instanceof PackPublishError) {
       console.error(`skillpack pack: ${err.message}`);
+      process.exit(2);
+    }
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// endorse — Garry-only registry tier override (operator workflow)
+// ---------------------------------------------------------------------------
+
+async function cmdEndorse(args: string[]): Promise<void> {
+  if (args.includes('--help') || args.includes('-h')) {
+    console.log(
+      'gbrain skillpack endorse <name> [--tier endorsed|community|experimental|dead] [--repo PATH] [--note TEXT] [--push] [--dry-run] [--json]\n\n' +
+        '  <name>     Pack name as it appears in registry.json\n' +
+        '  --tier     Target tier (default: endorsed)\n' +
+        '  --repo     Path to a clone of the registry repo (default: .)\n' +
+        '  --note     Optional human note recorded in endorsements.json\n' +
+        '  --push     git push origin HEAD after committing\n' +
+        '  --dry-run  Report what would change without writing or committing\n' +
+        '  --json     Stable JSON envelope for agent consumption\n\n' +
+        'This is the Garry-only operator workflow. It writes endorsements.json + commits;\n' +
+        'requires a clone of garrytan/gbrain-skillpack-registry (or any registry-shaped repo).',
+    );
+    process.exit(0);
+  }
+  const json = args.includes('--json');
+  const dryRun = args.includes('--dry-run');
+  const push = args.includes('--push');
+  let name: string | undefined;
+  let tier: 'endorsed' | 'community' | 'experimental' | 'dead' | undefined;
+  let repo: string | undefined;
+  let note: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === '--tier') {
+      tier = args[i + 1] as typeof tier;
+      i++;
+    } else if (a === '--repo') {
+      repo = args[i + 1];
+      i++;
+    } else if (a === '--note') {
+      note = args[i + 1];
+      i++;
+    } else if (a && !a.startsWith('--') && !name) {
+      name = a;
+    }
+  }
+  if (!name) {
+    console.error('Error: pass a skillpack name.');
+    process.exit(2);
+  }
+
+  const { runEndorse, EndorseError } = await import('../core/skillpack/endorse.ts');
+  const registryRepoRoot = resolveAbs(repo ?? '.');
+
+  try {
+    const result = runEndorse({
+      registryRepoRoot,
+      packName: name,
+      tier,
+      note,
+      push,
+      dryRun,
+    });
+    if (json) {
+      console.log(JSON.stringify(result, null, 2));
+    } else {
+      const verb = dryRun ? 'would endorse' : 'endorsed';
+      const fromTo = result.prior_tier
+        ? `${result.prior_tier} -> ${result.new_tier}`
+        : `(unset) -> ${result.new_tier}`;
+      console.log(`${verb}: ${result.pack_name} ${fromTo}`);
+      if (result.commit_sha) console.log(`commit: ${result.commit_sha}`);
+      if (result.pushed) console.log(`pushed to origin`);
+      if (dryRun) console.log(`\n(no writes; re-run without --dry-run to commit)`);
+    }
+    process.exit(0);
+  } catch (err) {
+    if (err instanceof EndorseError) {
+      console.error(`skillpack endorse: ${err.message}`);
       process.exit(2);
     }
     throw err;
