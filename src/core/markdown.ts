@@ -93,7 +93,7 @@ export function parseMarkdown(
 
   const { compiled_truth, timeline } = splitBody(body);
 
-  const type = (frontmatter.type as PageType) || inferType(filePath);
+  const type = (frontmatter.type as string) || inferType(filePath);
   const title = (frontmatter.title as string) || inferTitle(filePath);
   const tags = extractTags(frontmatter);
   const slug = (frontmatter.slug as string) || inferSlug(filePath);

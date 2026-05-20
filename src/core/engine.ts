@@ -133,8 +133,19 @@ export interface ReservedConnection {
  * derived index. Page-scoped via page_id (NOT slug — slug is unique only
  * within a source). `(page_id, row_num)` is the natural unique key.
  */
-export interface TakeKindLiteral { kind: 'fact' | 'take' | 'bet' | 'hunch' }
-export type TakeKind = TakeKindLiteral['kind'];
+// v0.38: TakeKind opens from closed 4-element union to string (T3/T10).
+// Pre-v0.38, kinds {fact|take|bet|hunch} were enforced by DB CHECK
+// (migrations v41/v48) AND by this TS closed union. Codex outside-voice
+// review caught that dropping the CHECK without also widening the TS
+// type "moves inconsistency around" — raw SQL and old clients could
+// poison rows that runtime-validate cleanly. v0.38 migration v76 drops
+// the CHECK; this widens the type. Runtime validation moves to the
+// active schema pack's `takes_kinds:` declaration. The annotation
+// primitive's seed list in gbrain-base reproduces {fact|take|bet|hunch}
+// so existing behavior is unchanged; packs can extend to {finding|
+// hypothesis|observation|...} per domain.
+export interface TakeKindLiteral { kind: string }
+export type TakeKind = string;
 
 /** Input row for addTakesBatch. */
 export interface TakeBatchInput {

@@ -381,7 +381,7 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   const sourceIdx = args.indexOf('--source');
   const source = (sourceIdx >= 0 && sourceIdx + 1 < args.length) ? args[sourceIdx + 1] : 'fs';
   const typeIdx = args.indexOf('--type');
-  const typeFilter = (typeIdx >= 0 && typeIdx + 1 < args.length) ? (args[typeIdx + 1] as PageType) : undefined;
+  const typeFilter = (typeIdx >= 0 && typeIdx + 1 < args.length) ? (args[typeIdx + 1] as string) : undefined;
   const sinceIdx = args.indexOf('--since');
   const since = (sinceIdx >= 0 && sinceIdx + 1 < args.length) ? args[sinceIdx + 1] : undefined;
   const dryRun = args.includes('--dry-run');

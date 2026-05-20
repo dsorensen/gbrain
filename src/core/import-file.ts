@@ -634,7 +634,7 @@ export async function importCodeFile(
     if (existing) await tx.createVersion(slug, txOpts);
 
     await tx.putPage(slug, {
-      type: 'code' as PageType,
+      type: 'code' as string,
       page_kind: 'code',
       title,
       compiled_truth: content,

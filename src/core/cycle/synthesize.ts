@@ -949,7 +949,7 @@ export function renderPageToMarkdown(page: Page, tags: string[]): string {
     page.compiled_truth ?? '',
     page.timeline ?? '',
     {
-      type: (page.type as PageType) ?? 'note',
+      type: (page.type as string) ?? 'note',
       title: page.title ?? '',
       tags,
     },
@@ -992,7 +992,7 @@ async function writeSummaryPage(
     { dream_generated: true, dream_cycle_date: summaryDate } as Record<string, unknown>,
     body,
     '',
-    { type: 'note' as PageType, title: `Dream cycle ${summaryDate}`, tags: ['dream-cycle'] },
+    { type: 'note' as string, title: `Dream cycle ${summaryDate}`, tags: ['dream-cycle'] },
   );
 
   // Direct engine.putPage — orchestrator write, no subagent context, no

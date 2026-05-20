@@ -2056,7 +2056,7 @@ export class PostgresEngine implements BrainEngine {
     return rows.map((r: Record<string, unknown>) => ({
       slug: r.slug as string,
       title: r.title as string,
-      type: r.type as PageType,
+      type: r.type as string,
       depth: r.depth as number,
       links: (typeof r.links === 'string' ? JSON.parse(r.links) : r.links) as { to_slug: string; link_type: string }[],
     }));
