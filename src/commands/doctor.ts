@@ -1101,6 +1101,151 @@ export async function checkEmbeddingWidthConsistency(engine: BrainEngine): Promi
  * the mode (e.g. mode=conservative but cache.enabled=false), say so in
  * the message and paste a `gbrain search modes --reset` fix command.
  */
+
+/**
+ * v0.37.7.0 — Tier 5K source_routing_health (D5 lock: 200-page total cap).
+ *
+ * On a multi-source brain, sample up to 200 recent pages across all
+ * non-default sources (per-source cap = min(50, ceil(200/N))). Warn
+ * when:
+ *  - A non-default source has zero pages (silent-collapse-to-default
+ *    fingerprint from #1167 + #1222).
+ *  - The brain repo has a `.gitignore` file but
+ *    `sync.respect_gitignore` is unset/false (info-line nudge for
+ *    Tier 4I's opt-in flag).
+ *
+ * Cost-bounded: total cap of 200 means a 20-source CEO brain pays
+ * 20*10 = 200 selects rather than 20*50 = 1000.
+ */
+export async function checkSourceRoutingHealth(engine: BrainEngine): Promise<Check> {
+  try {
+    const sources = await engine.executeRaw<{ id: string }>(
+      `SELECT id FROM sources WHERE id <> 'default'`,
+    );
+    if (sources.length === 0) {
+      return { name: 'source_routing_health', status: 'ok', message: 'Single-source brain (no federation to check)' };
+    }
+    const perSourceCap = Math.min(50, Math.ceil(200 / Math.max(1, sources.length)));
+    const emptySources: string[] = [];
+    for (const s of sources) {
+      const rows = await engine.executeRaw<{ n: string }>(
+        `SELECT COUNT(*)::text AS n FROM pages WHERE source_id = $1 LIMIT $2`,
+        [s.id, perSourceCap],
+      );
+      if (Number(rows[0]?.n ?? 0) === 0) {
+        emptySources.push(s.id);
+      }
+    }
+    if (emptySources.length > 0) {
+      return {
+        name: 'source_routing_health',
+        status: 'warn',
+        message:
+          `${emptySources.length} non-default source(s) have zero pages: ${emptySources.join(', ')}. ` +
+          `If you've recently run \`gbrain import --source-id <id>\` against these, the writes may have ` +
+          `silently fallen to the default source pre-v0.37.7.0. Re-run with --source-id; verify via ` +
+          `\`gbrain sources current --json\`.`,
+      };
+    }
+    return {
+      name: 'source_routing_health',
+      status: 'ok',
+      message: `Multi-source brain (${sources.length} non-default source(s)); all populated`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { name: 'source_routing_health', status: 'warn', message: `Check failed: ${msg}` };
+  }
+}
+
+/**
+ * v0.37.7.0 — Tier 5L oauth_confidential_client_health.
+ *
+ * Confidential OAuth clients (token_endpoint_auth_method != 'none')
+ * MUST have a non-NULL client_secret_hash. v0.34.1.0's #909 fix
+ * intentionally NULLs the column for public PKCE clients; if any
+ * row claims confidential auth but has NULL hash, that's the
+ * regression fingerprint from #1166.
+ */
+export async function checkOauthConfidentialHealth(engine: BrainEngine): Promise<Check> {
+  try {
+    const rows = await engine.executeRaw<{ client_id: string; method: string | null; hash: string | null }>(
+      `SELECT client_id,
+              token_endpoint_auth_method AS method,
+              client_secret_hash AS hash
+         FROM oauth_clients`,
+    );
+    if (rows.length === 0) {
+      return { name: 'oauth_confidential_client_health', status: 'ok', message: 'No OAuth clients registered' };
+    }
+    const broken = rows.filter(r => {
+      const isPublic = r.method === 'none';
+      return !isPublic && (r.hash == null || r.hash === '');
+    });
+    if (broken.length > 0) {
+      return {
+        name: 'oauth_confidential_client_health',
+        status: 'fail',
+        message:
+          `${broken.length} confidential OAuth client(s) have NULL/empty secret hash: ${broken.map(b => b.client_id).slice(0, 5).join(', ')}` +
+          (broken.length > 5 ? ` (+${broken.length - 5} more)` : '') +
+          `. Fix: \`gbrain auth revoke-client <id> && gbrain auth register-client …\` for each, OR \`gbrain upgrade\` if pre-v0.37.7.0.`,
+      };
+    }
+    return {
+      name: 'oauth_confidential_client_health',
+      status: 'ok',
+      message: `${rows.length} OAuth client(s) registered; all auth shapes consistent`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Pre-OAuth schema (oauth_clients table missing) → ok.
+    if (msg.toLowerCase().includes('relation') && msg.toLowerCase().includes('does not exist')) {
+      return { name: 'oauth_confidential_client_health', status: 'ok', message: 'OAuth not configured (skipping)' };
+    }
+    return { name: 'oauth_confidential_client_health', status: 'warn', message: `Check failed: ${msg}` };
+  }
+}
+
+/**
+ * v0.37.7.0 — Tier 5M autopilot_lock_scope (PID-safe hint per codex CF11).
+ *
+ * Detects stale autopilot lockfiles. When `GBRAIN_HOME` is set, the
+ * canonical lock path lives under `gbrainPath('autopilot.lock')`.
+ * If a hardcoded `~/.gbrain/autopilot.lock` ALSO exists outside the
+ * current `GBRAIN_HOME`, that's a pre-v0.37.7.0 leftover or a
+ * different brain's lock. Hint includes PID + a `ps -p` check so
+ * the user verifies before deleting.
+ */
+export function checkAutopilotLockScope(): Check {
+  try {
+    const canonical = gbrainPath('autopilot.lock');
+    const home = process.env.HOME || '';
+    const legacy = home ? `${home}/.gbrain/autopilot.lock` : '';
+    // Same path → nothing to surface.
+    if (canonical === legacy || !legacy || !existsSync(legacy)) {
+      return { name: 'autopilot_lock_scope', status: 'ok', message: `Lock path: ${canonical}` };
+    }
+    // legacy lock exists outside GBRAIN_HOME. Read its PID for a safe hint.
+    let owningPid: string = 'unknown';
+    try {
+      const raw = readFileSync(legacy, 'utf8').trim();
+      if (/^\d+$/.test(raw)) owningPid = raw;
+    } catch { /* unreadable → leave 'unknown' */ }
+    return {
+      name: 'autopilot_lock_scope',
+      status: 'warn',
+      message:
+        `Stale lockfile outside GBRAIN_HOME: ${legacy} (owning PID: ${owningPid}). ` +
+        `Verify with \`ps -p ${owningPid}\` — if the process is dead, \`rm ${legacy}\`. ` +
+        `If alive, identify it (\`ps -fp ${owningPid}\`) and stop before deleting.`,
+    };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { name: 'autopilot_lock_scope', status: 'warn', message: `Check failed: ${msg}` };
+  }
+}
+
 export async function checkSearchMode(engine: BrainEngine): Promise<Check> {
   try {
     const mode = await engine.getConfig('search.mode');
@@ -3540,6 +3685,18 @@ export async function runDoctor(engine: BrainEngine | null, args: string[], dbSo
     checks.push(await checkZeEmbeddingHealth(engine));
     progress.heartbeat('embedding_width_consistency');
     checks.push(await checkEmbeddingWidthConsistency(engine));
+
+    // v0.37.7.0 doctor checks (#1167, #1166, #1226) — fast-mode skipped
+    // since these touch DB queries with cost on large brains.
+    // 5K — source_routing_health (D5 lock: 200-page total cap)
+    progress.heartbeat('source_routing_health');
+    checks.push(await checkSourceRoutingHealth(engine));
+    // 5L — oauth_confidential_client_health (success-path probe per codex CF8)
+    progress.heartbeat('oauth_confidential_client_health');
+    checks.push(await checkOauthConfidentialHealth(engine));
+    // 5M — autopilot_lock_scope (PID-safe hint per codex CF11)
+    progress.heartbeat('autopilot_lock_scope');
+    checks.push(checkAutopilotLockScope());
   }
 
   progress.finish();
