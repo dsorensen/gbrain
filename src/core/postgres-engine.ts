@@ -2920,6 +2920,7 @@ export class PostgresEngine implements BrainEngine {
     const sinceDate = opts.since ? new Date(opts.since) : null;
     const untilDate = opts.until ? new Date(opts.until) : null;
     const metric = opts.metric ?? null;
+    const kind = opts.kind ?? 'all';
     const useArray = Array.isArray(opts.sourceIds) && opts.sourceIds.length > 0;
     const sourceIds = useArray ? opts.sourceIds! : null;
     const sourceId = opts.sourceId ?? 'default';
@@ -2928,6 +2929,7 @@ export class PostgresEngine implements BrainEngine {
     // Source-scope predicate: array path (federated) wins over scalar.
     // Engine.ts contract: returns chronological points; regressions +
     // drift_score are computed by the caller (src/core/trajectory.ts).
+    // v0.40.2.0 — kind filter ('all'|'metric'|'event'); event_type column.
     const rows = await sql<Array<{
       id: number;
       valid_from: Date;
@@ -2935,6 +2937,7 @@ export class PostgresEngine implements BrainEngine {
       claim_value: number | null;
       claim_unit: string | null;
       claim_period: string | null;
+      event_type: string | null;
       fact: string;
       source_session: string | null;
       source_markdown_slug: string | null;
@@ -2942,6 +2945,7 @@ export class PostgresEngine implements BrainEngine {
     }>>`
       SELECT id, valid_from,
              claim_metric, claim_value, claim_unit, claim_period,
+             event_type,
              fact, source_session, source_markdown_slug,
              embedding::text AS embedding
       FROM facts
@@ -2950,6 +2954,8 @@ export class PostgresEngine implements BrainEngine {
         AND expired_at IS NULL
         ${remoteFilter ? sql`AND visibility = 'world'` : sql``}
         ${metric !== null ? sql`AND claim_metric = ${metric}` : sql``}
+        ${kind === 'metric' ? sql`AND claim_metric IS NOT NULL` : sql``}
+        ${kind === 'event' ? sql`AND event_type IS NOT NULL` : sql``}
         ${sinceDate ? sql`AND valid_from >= ${sinceDate}` : sql``}
         ${untilDate ? sql`AND valid_from <= ${untilDate}` : sql``}
       ORDER BY valid_from ASC, id ASC
@@ -2963,6 +2969,7 @@ export class PostgresEngine implements BrainEngine {
       value: r.claim_value === null ? null : Number(r.claim_value),
       unit: r.claim_unit,
       period: r.claim_period,
+      event_type: r.event_type,
       text: r.fact,
       source_session: r.source_session,
       source_markdown_slug: r.source_markdown_slug,
