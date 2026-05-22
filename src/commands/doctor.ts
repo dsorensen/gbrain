@@ -896,10 +896,17 @@ export async function checkGraphSignalsCoverage(engine: BrainEngine): Promise<Ch
     const cfgVal = await engine.getConfig('search.graph_signals');
     let enabled: boolean;
     if (cfgVal !== null && cfgVal !== undefined) {
-      enabled = cfgVal === 'true' || cfgVal === '1';
+      // v0.40.4 codex F1 — case-insensitive + trim, parity with
+      // loadOverridesFromConfig in src/core/search/mode.ts. Without
+      // this, `gbrain config set search.graph_signals TRUE` enables
+      // the feature in production but doctor reports "disabled".
+      const v = cfgVal.trim().toLowerCase();
+      enabled = v === 'true' || v === '1';
     } else {
-      // Mode bundle default. Read search.mode (defaults to balanced).
-      const modeVal = await engine.getConfig('search.mode');
+      // Mode bundle default. Read search.mode (case-insensitive + trim
+      // parity with isSearchMode + DEFAULT_SEARCH_MODE fallback).
+      const modeRaw = await engine.getConfig('search.mode');
+      const modeVal = typeof modeRaw === 'string' ? modeRaw.trim().toLowerCase() : '';
       const mode = modeVal === 'conservative' || modeVal === 'tokenmax' ? modeVal : 'balanced';
       // Hardcoded knowledge of the mode bundle defaults — keeps the
       // doctor check from pulling in the full search/mode.ts surface.

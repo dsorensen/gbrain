@@ -74,12 +74,14 @@ async function runQuestion(
     await importFromContent(engine, p.slug, p.content, { noEmbed: true });
   }
   // Keyword-only path is most stable on tiny fixtures with no embedder.
-  // Use hybridSearch which honors per-call graph_signals override.
+  // Use hybridSearch which honors per-call graph_signals override
+  // (v0.40.4 — typed field on SearchOpts, threaded into perCall in
+  // hybrid.ts via resolveSearchMode chain).
   const results = await hybridSearch(engine, q.question, {
     limit: TOP_K,
     expansion: false,
     graph_signals: graphSignalsOn,
-  } as any);
+  });
   const sessionIds = uniqSessionIds(results);
   const gt = new Set(q.answer_session_ids ?? []);
   const hit = sessionIds.some(s => gt.has(s));

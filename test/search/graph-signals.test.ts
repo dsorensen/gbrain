@@ -54,17 +54,42 @@ function makeResult(slug: string, score: number, page_id: number, source_id = 'a
 // throwing if accidentally hit.
 const ENGINE_STUB = {} as BrainEngine;
 
-describe('sessionPrefix', () => {
-  test('multi-segment slug → strip last segment', () => {
-    expect(sessionPrefix('media/chat/2026-05-20-foo')).toBe('media/chat');
+describe('sessionPrefix (v0.40.4 narrowed scope — codex fix for entity-dir false positives)', () => {
+  test('chat marker → prefix up to and including session id', () => {
+    expect(sessionPrefix('your-agent/chat/2026-05-20-foo')).toBe('your-agent/chat/2026-05-20-foo');
   });
 
-  test('single-segment slug → self (no false grouping)', () => {
-    expect(sessionPrefix('standalone')).toBe('standalone');
+  test('chat marker with trailing chunk segment → prefix is parent', () => {
+    // For media/chat/2026-05-20-foo/chunk-001, the chat-session is
+    // media/chat/2026-05-20-foo (the parent of the chunk file).
+    expect(sessionPrefix('media/chat/2026-05-20-foo/chunk-001')).toBe('media/chat/2026-05-20-foo');
   });
 
-  test('empty slug → empty', () => {
-    expect(sessionPrefix('')).toBe('');
+  test('date segment in middle of path → prefix is up to and including date', () => {
+    expect(sessionPrefix('daily/2026-05-20/journal-entry-1')).toBe('daily/2026-05-20');
+  });
+
+  test('transcripts marker → prefix up to and including transcript id', () => {
+    expect(sessionPrefix('transcripts/chat/funding-discussion')).toBe('transcripts/chat/funding-discussion');
+  });
+
+  test('entity directory (no marker, no date) → null (skip diversification)', () => {
+    expect(sessionPrefix('people/alice')).toBeNull();
+    expect(sessionPrefix('companies/acme')).toBeNull();
+    expect(sessionPrefix('wiki/concepts/auth')).toBeNull();
+    expect(sessionPrefix('docs/quickstart')).toBeNull();
+  });
+
+  test('single-segment slug → null (no path, no session)', () => {
+    expect(sessionPrefix('standalone')).toBeNull();
+  });
+
+  test('empty slug → null', () => {
+    expect(sessionPrefix('')).toBeNull();
+  });
+
+  test('meetings + date → meeting-session prefix', () => {
+    expect(sessionPrefix('meetings/2026-04-03/notes')).toBe('meetings/2026-04-03');
   });
 });
 
@@ -196,11 +221,11 @@ describe('applyGraphSignals — cross-source boost (stacks on adjacency)', () =>
 });
 
 describe('applyGraphSignals — session diversification', () => {
-  test('3 results share session prefix → highest keeps full, other 2 demoted', async () => {
+  test('3 chat-session chunks share prefix → highest keeps full, other 2 demoted', async () => {
     const results = [
-      makeResult('media/chat/2026-05-20/a', 10, 1),
-      makeResult('media/chat/2026-05-20/b', 9, 2),
-      makeResult('media/chat/2026-05-20/c', 7, 3),
+      makeResult('media/chat/2026-05-20-foo/a', 10, 1),
+      makeResult('media/chat/2026-05-20-foo/b', 9, 2),
+      makeResult('media/chat/2026-05-20-foo/c', 7, 3),
     ];
     await applyGraphSignals(results, ENGINE_STUB, {
       enabled: true,
@@ -210,7 +235,7 @@ describe('applyGraphSignals — session diversification', () => {
     const a = results[0];
     expect(a.score).toBe(10);
     expect(a.graph_session_demoted).toBeUndefined();
-    expect(a.graph_session_prefix).toBe('media/chat/2026-05-20');
+    expect(a.graph_session_prefix).toBe('media/chat/2026-05-20-foo');
     // Others demoted.
     expect(results[1].score).toBeCloseTo(9 * SESSION_DEMOTE, 5);
     expect(results[1].graph_session_demoted).toBe(true);
@@ -219,17 +244,39 @@ describe('applyGraphSignals — session diversification', () => {
     expect(results[2].graph_session_demoted).toBe(true);
   });
 
-  test('single-segment slug (no /) → not grouped with others, no false demote', async () => {
+  test('REGRESSION (codex H2): entity-directory siblings (people/alice + people/bob) are NOT diversified', async () => {
+    // Pre-fix behavior: people/alice + people/bob shared `people/` prefix
+    // and people/bob got demoted. This silently penalized every common
+    // entity-search query like "people in SF". Post-fix: sessionPrefix
+    // returns null for non-session slugs, so no diversification fires.
     const results = [
-      makeResult('standalone', 10, 1),
-      makeResult('media/chat/2026-05-20/a', 9, 2),
-      makeResult('media/chat/2026-05-20/b', 8, 3),
+      makeResult('people/alice', 10, 1),
+      makeResult('people/bob', 9, 2),
+      makeResult('people/charlie', 7, 3),
     ];
     await applyGraphSignals(results, ENGINE_STUB, {
       enabled: true,
       adjacencyFn: async () => new Map(),
     });
-    // standalone: own session = 'standalone', size 1 → no demote.
+    expect(results[0].score).toBe(10);
+    expect(results[1].score).toBe(9);   // NOT demoted
+    expect(results[2].score).toBe(7);   // NOT demoted
+    expect(results[0].graph_session_demoted).toBeUndefined();
+    expect(results[1].graph_session_demoted).toBeUndefined();
+    expect(results[2].graph_session_demoted).toBeUndefined();
+  });
+
+  test('non-session slug (no chat/date marker) → not grouped, no false demote', async () => {
+    const results = [
+      makeResult('standalone', 10, 1),
+      makeResult('media/chat/2026-05-20-foo/a', 9, 2),
+      makeResult('media/chat/2026-05-20-foo/b', 8, 3),
+    ];
+    await applyGraphSignals(results, ENGINE_STUB, {
+      enabled: true,
+      adjacencyFn: async () => new Map(),
+    });
+    // standalone: not session-shaped → no demote.
     const standalone = results[0];
     expect(standalone.score).toBe(10);
     expect(standalone.graph_session_demoted).toBeUndefined();
@@ -240,8 +287,8 @@ describe('applyGraphSignals — session diversification', () => {
 
   test('singleton session group → no demote', async () => {
     const results = [
-      makeResult('foo/bar', 10, 1),
-      makeResult('baz/qux', 9, 2),
+      makeResult('media/chat/foo-session', 10, 1),
+      makeResult('media/chat/bar-session', 9, 2),
     ];
     await applyGraphSignals(results, ENGINE_STUB, {
       enabled: true,
@@ -332,9 +379,13 @@ describe('applyGraphSignals — fail-open', () => {
   });
 
   test('adjacencyFn returns empty Map → no boosts, session diversification still runs', async () => {
+    // Use session-shaped slugs (date anchor) so sessionPrefix returns a
+    // real session id, not null. Post-v0.40.4 codex fix: bare `chat/a`
+    // + `chat/b` would no longer group because sessionPrefix returns
+    // 'chat/a' and 'chat/b' respectively (each treated as own session).
     const results = [
-      makeResult('chat/a', 10, 1),
-      makeResult('chat/b', 9, 2),
+      makeResult('media/2026-05-20/chunk-a', 10, 1),
+      makeResult('media/2026-05-20/chunk-b', 9, 2),
     ];
     let metaOut: any;
     await applyGraphSignals(results, ENGINE_STUB, {
@@ -344,7 +395,7 @@ describe('applyGraphSignals — fail-open', () => {
     });
     expect(metaOut.errored).toBe(false);
     expect(metaOut.adjacency_fires).toBe(0);
-    // Session demotion DOES fire because two pages share 'chat' prefix.
+    // Session demotion DOES fire — both share session 'media/2026-05-20'.
     expect(metaOut.session_demotions).toBe(1);
   });
 });
@@ -376,9 +427,12 @@ describe('applyGraphSignals — score-distribution probe', () => {
 
 describe('applyGraphSignals — meta + timing', () => {
   test('meta carries fire counts and duration_ms', async () => {
+    // Session-shaped slugs (date anchor) so sessionPrefix returns the
+    // same session for chunk-a + chunk-b. Pre-v0.40.4 codex fix: bare
+    // 'chat/a' had session 'chat' but post-fix that returns null.
     const results = [
-      makeResult('chat/a', 10, 1),
-      makeResult('chat/b', 9, 2),
+      makeResult('media/2026-05-20/chunk-a', 10, 1),
+      makeResult('media/2026-05-20/chunk-b', 9, 2),
       makeResult('hub', 8, 3),
     ];
     const adjacency = new Map<number, AdjacencyRow>([

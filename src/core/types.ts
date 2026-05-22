@@ -792,6 +792,18 @@ export interface SearchOpts {
    * sending them produces garbage scores.
    */
   crossModal?: 'text' | 'image' | 'both' | 'auto';
+  /**
+   * v0.40.4 — per-call override for the graph-signals stage. Threads
+   * through to PostFusionOpts.graphSignalsEnabled. When undefined,
+   * falls through to the active mode bundle default (conservative=false,
+   * balanced/tokenmax=true) via the resolveSearchMode chain.
+   *
+   * Primary consumer is eval gates: `graph-signals-eval.test.ts` runs
+   * each fixture question twice (off vs on) and needs explicit per-call
+   * control, not mode-bundle default. Without this field, both branches
+   * would resolve to the same mode default and the gate would be a no-op.
+   */
+  graph_signals?: boolean;
 }
 
 /**

@@ -420,6 +420,10 @@ export async function hybridSearch(
       // over per-key config wins over mode bundle (currently undefined for
       // all 3 bundles — pending ablation evidence).
       floor_ratio: opts?.floorRatio,
+      // v0.40.4 — graph_signals thread-through. Per-call wins over config
+      // override wins over mode bundle. Without this thread the eval gate
+      // would be a no-op (both branches resolve to the same mode default).
+      graph_signals: opts?.graph_signals,
     },
   });
 
@@ -1021,6 +1025,12 @@ export async function hybridSearchCached(
       // Without this, a no-floor write would be served to a floor-enabled
       // read (ranking-correctness leak, codex T1).
       floor_ratio: opts?.floorRatio,
+      // v0.40.4 — graph_signals threaded through cache resolver too so
+      // knobsHash() includes the per-call override (KNOBS_HASH_VERSION=4
+      // folds gs= into the hash). Without this thread, a per-call
+      // override would write to one cache row but read from a different
+      // one on the next call.
+      graph_signals: opts?.graph_signals,
     },
   });
   // v0.36 (D8 / CDX-2 + codex /ship #4): resolve column for the cache

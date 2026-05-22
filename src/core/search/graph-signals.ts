@@ -161,18 +161,73 @@ export function readRecentGraphSignalsFailures(
 // ===========================================================================
 
 /**
- * Derive the session prefix for a slug. For `media/chat/2026-05-20-foo`
- * returns `media/chat/2026-05-20-foo` (last segment dropped is the
- * file itself — actually we want the parent path). Wait — the session is
- * the directory the chat lives in, so the prefix is the slug up to but
- * not including the last `/`. For a slug with no `/` (`'standalone'`),
- * the prefix is the slug itself; treating it as its own session means
- * single-segment slugs never group with anything else (which is correct).
+ * Pattern: session-like slugs have either a `chat/` segment or a YYYY-MM-DD
+ * date segment somewhere in the path. Both signal "this is one of many
+ * chunks from the same recorded session/transcript/log entry" — the case
+ * where multiple result rows from a single weak source dilute a stronger
+ * non-session hit.
+ *
+ * Examples that ARE sessions (return a real session prefix):
+ *   - `your-agent/chat/2026-05-20-foo`           → 'your-agent/chat/2026-05-20-foo'
+ *   - `daily/2026-05-20/journal-entry-1`         → 'daily/2026-05-20'
+ *   - `meetings/2026-04-03/notes`                → 'meetings/2026-04-03'
+ *   - `transcripts/chat/funding-discussion`      → 'transcripts/chat/funding-discussion'
+ *
+ * Examples that are NOT sessions (return null — no diversification):
+ *   - `people/alice`, `people/bob`               → entity directory, NOT a session
+ *   - `companies/acme`, `companies/stripe`       → entity directory, NOT a session
+ *   - `docs/quickstart`, `docs/api`              → topical directory, NOT a session
+ *   - `wiki/concepts/auth`                        → topical, not date-anchored
+ *
+ * This is the codex outside-voice fix: the original v0.40.4 implementation
+ * used "any shared parent directory" as the session signal, which silently
+ * demoted legitimate same-type entity results in every common entity
+ * search (`people/alice` + `people/bob` got grouped, one demoted).
+ *
+ * Returns `null` when the slug isn't session-shaped (caller skips
+ * diversification entirely for this result).
  */
-export function sessionPrefix(slug: string): string {
-  const lastSlash = slug.lastIndexOf('/');
-  if (lastSlash < 0) return slug;
-  return slug.slice(0, lastSlash);
+const DATE_SEGMENT_RE = /^\d{4}-\d{2}-\d{2}/;
+// Only 'chat' / 'session' / 'sessions' are session MARKERS — words that
+// indicate "the next segment is a session id." Words like 'transcripts'
+// or 'meetings' are CATEGORIES (parents of sessions, not markers
+// themselves). A path like `transcripts/chat/funding-discussion` should
+// be the WHOLE thing (parent + marker + session id), which only works
+// if 'transcripts' is NOT a marker but 'chat' IS.
+const SESSION_MARKERS = new Set(['chat', 'session', 'sessions']);
+
+export function sessionPrefix(slug: string): string | null {
+  if (!slug.includes('/')) return null;
+  const segments = slug.split('/');
+  // Strategy: walk segments left-to-right. Find the first segment that's
+  // either a session marker (chat/session/sessions) OR a date prefix.
+  // Session prefix shape:
+  //   - On marker: everything up to AND INCLUDING the segment after the
+  //     marker (that segment is the session id). If the marker is the
+  //     last segment (degenerate), include up to the marker itself.
+  //   - On date: everything up to and including the date segment.
+  //
+  // Examples:
+  //   your-agent/chat/2026-05-20-foo → 'your-agent/chat/2026-05-20-foo'
+  //   media/chat/2026-05-20-foo/chunk-001 → 'media/chat/2026-05-20-foo'
+  //   transcripts/chat/funding-discussion → 'transcripts/chat/funding-discussion'
+  //   daily/2026-05-20/journal-entry-1 → 'daily/2026-05-20'
+  //   meetings/2026-04-03/notes → 'meetings/2026-04-03'
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (SESSION_MARKERS.has(seg)) {
+      // Session id is segment i+1 (or the marker itself if i+1 doesn't exist).
+      const sessionIdIdx = Math.min(i + 1, segments.length - 1);
+      return segments.slice(0, sessionIdIdx + 1).join('/');
+    }
+    if (DATE_SEGMENT_RE.test(seg)) {
+      // Date anchor — session is everything up to and including the date.
+      return segments.slice(0, i + 1).join('/');
+    }
+  }
+  // No session marker and no date anchor — entity / topic / docs
+  // directory, not a session. Skip diversification.
+  return null;
 }
 
 /**
@@ -318,9 +373,16 @@ export async function applyGraphSignals(
   }
 
   // ---- Session diversification (D9 single-pass Map, D11=B DEMOTE) ----
+  // Only fires when sessionPrefix detects a session-like pattern
+  // (chat/transcript marker OR date segment). Non-session slugs
+  // (entity directories like `people/`, `companies/`, topical dirs
+  // like `docs/`) skip diversification entirely — codex outside-voice
+  // catch: the original implementation grouped ALL same-parent-directory
+  // slugs, which silently demoted legitimate entity-search results.
   const sessionGroups = new Map<string, SearchResult[]>();
   for (const r of topK) {
     const prefix = sessionPrefix(r.slug);
+    if (prefix === null) continue;  // not session-shaped — skip diversification
     let group = sessionGroups.get(prefix);
     if (!group) {
       group = [];

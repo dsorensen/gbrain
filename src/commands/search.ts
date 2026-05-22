@@ -281,14 +281,20 @@ interface GraphSignalsStatsSection {
 async function readGraphSignalsStats(engine: BrainEngine, days: number): Promise<GraphSignalsStatsSection> {
   // Resolve graph_signals on/off. Mirrors the resolution chain in
   // src/commands/doctor.ts:checkGraphSignalsCoverage.
+  // v0.40.4 codex F1: case-insensitive + trim parity with
+  // loadOverridesFromConfig (mode.ts). Without this, search-stats would
+  // silently report the opposite of what the parser actually enables on
+  // values like 'TRUE' or 'True'.
   const cfg = await engine.getConfig('search.graph_signals').catch(() => null);
   let enabled: boolean;
   let source: 'config' | 'mode_default';
   if (cfg !== null && cfg !== undefined) {
-    enabled = cfg === 'true' || cfg === '1';
+    const v = cfg.trim().toLowerCase();
+    enabled = v === 'true' || v === '1';
     source = 'config';
   } else {
-    const modeVal = await engine.getConfig('search.mode').catch(() => null);
+    const modeRaw = await engine.getConfig('search.mode').catch(() => null);
+    const modeVal = typeof modeRaw === 'string' ? modeRaw.trim().toLowerCase() : '';
     const mode = modeVal === 'conservative' || modeVal === 'tokenmax' ? modeVal : 'balanced';
     enabled = mode !== 'conservative';
     source = 'mode_default';
