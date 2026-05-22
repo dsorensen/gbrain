@@ -37,7 +37,17 @@ afterAll(async () => {
 });
 
 describe('readContentChunksEmbeddingDim', () => {
-  test('returns dims from a migrated brain (default 1536)', async () => {
+  test('returns dims from a migrated brain (1536d via legacy-embedding preload)', async () => {
+    // v0.37 fix wave: the canonical gateway default is now 1280 (ZE).
+    // However, `bunfig.toml` preloads `test/helpers/legacy-embedding-preload.ts`
+    // which configures the gateway to OpenAI/1536 BEFORE any test runs.
+    // This preserves the 20+ test files with hardcoded 1536-d
+    // Float32Array fixtures. So initSchema() under tests produces a
+    // 1536-d column.
+    //
+    // New v0.37 tests that need to assert the ZE/1280 default can call
+    // configureGateway() explicitly in their own beforeAll, which
+    // overrides the preload.
     const result = await readContentChunksEmbeddingDim(engine);
     expect(result.exists).toBe(true);
     expect(result.dims).toBe(1536);
@@ -59,12 +69,13 @@ describe('readContentChunksEmbeddingDim', () => {
 });
 
 describe('embeddingMismatchMessage', () => {
-  test('inlines all four recipe steps for HNSW-eligible dims', () => {
+  test('Postgres branch inlines all four recipe steps for HNSW-eligible dims', () => {
     const msg = embeddingMismatchMessage({
       currentDims: 1536,
       requestedDims: 768,
       requestedModel: 'nomic-embed-text',
       source: 'init',
+      engineKind: 'postgres',
     });
     expect(msg).toContain('vector(1536)');
     expect(msg).toContain('vector(768)');
@@ -75,7 +86,7 @@ describe('embeddingMismatchMessage', () => {
     expect(msg).toContain('docs/embedding-migrations.md');
   });
 
-  test('skips HNSW recreate when requested dims exceed pgvector cap', () => {
+  test('Postgres branch skips HNSW recreate when requested dims exceed pgvector cap', () => {
     // Codex finding #8: 2048d (Voyage 4 Large) cannot be HNSW-indexed in pgvector.
     // The recipe must NOT instruct a CREATE INDEX HNSW for that dim.
     const msg = embeddingMismatchMessage({
@@ -83,6 +94,7 @@ describe('embeddingMismatchMessage', () => {
       requestedDims: 2048,
       requestedModel: 'voyage-4-large',
       source: 'init',
+      engineKind: 'postgres',
     });
     expect(msg).toContain('vector(2048)');
     expect(msg).toContain('Skip reindex');
@@ -92,10 +104,56 @@ describe('embeddingMismatchMessage', () => {
   });
 
   test('source: doctor uses a different header than source: init', () => {
-    const initMsg = embeddingMismatchMessage({ currentDims: 1536, requestedDims: 768, source: 'init' });
-    const doctorMsg = embeddingMismatchMessage({ currentDims: 1536, requestedDims: 768, source: 'doctor' });
+    const initMsg = embeddingMismatchMessage({ currentDims: 1536, requestedDims: 768, source: 'init', engineKind: 'postgres' });
+    const doctorMsg = embeddingMismatchMessage({ currentDims: 1536, requestedDims: 768, source: 'doctor', engineKind: 'postgres' });
     expect(initMsg).toContain('Refusing to silently re-template');
     expect(doctorMsg).toContain('Embedding dimension mismatch detected');
+  });
+
+  // v0.37 fix wave Lane D.1: PGLite branch uses wipe-and-reinit recipe
+  // because PGLite can't ALTER vector column types.
+  test('PGLite branch uses wipe-and-reinit, not ALTER COLUMN', () => {
+    const msg = embeddingMismatchMessage({
+      currentDims: 1536,
+      requestedDims: 1280,
+      requestedModel: 'zeroentropyai:zembed-1',
+      source: 'init',
+      engineKind: 'pglite',
+      databasePath: '/tmp/test-brain.pglite',
+    });
+    expect(msg).toContain('vector(1536)');
+    expect(msg).toContain('vector(1280)');
+    expect(msg).toContain('mv /tmp/test-brain.pglite /tmp/test-brain.pglite.bak');
+    expect(msg).toContain('gbrain init --pglite --embedding-model zeroentropyai:zembed-1 --embedding-dimensions 1280');
+    expect(msg).toContain('PGLite cannot ALTER vector column types');
+    // Must NOT contain the Postgres-only SQL recipe.
+    expect(msg).not.toContain('ALTER TABLE content_chunks ALTER COLUMN');
+    expect(msg).not.toContain('DROP INDEX IF EXISTS idx_chunks_embedding');
+  });
+
+  test('PGLite branch falls back to default database path when omitted', () => {
+    const msg = embeddingMismatchMessage({
+      currentDims: 1536,
+      requestedDims: 1280,
+      source: 'init',
+      engineKind: 'pglite',
+    });
+    // Default falls back to gbrainPath('brain.pglite').
+    expect(msg).toMatch(/mv .+brain\.pglite .+brain\.pglite\.bak/);
+  });
+
+  test('PGLite branch must NOT recommend `gbrain config set embedding_model` (no-op after Lane C.2)', () => {
+    const msg = embeddingMismatchMessage({
+      currentDims: 1536,
+      requestedDims: 1280,
+      requestedModel: 'zeroentropyai:zembed-1',
+      source: 'doctor',
+      engineKind: 'pglite',
+    });
+    // The pre-v0.37 recipe pointed at `gbrain config set embedding_model X`
+    // which is a no-op after C.2. Recipe must point at init instead.
+    expect(msg).not.toContain('gbrain config set embedding_model');
+    expect(msg).not.toContain('gbrain config set embedding_dimensions');
   });
 });
 

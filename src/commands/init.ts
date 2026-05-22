@@ -6,7 +6,7 @@ import { homedir } from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-import { saveConfig, loadConfig, toEngineConfig, gbrainPath, configPath, isThinClient, type GBrainConfig } from '../core/config.ts';
+import { saveConfig, loadConfig, loadConfigFileOnly, toEngineConfig, gbrainPath, configPath, isThinClient, type GBrainConfig } from '../core/config.ts';
 import { createEngine } from '../core/engine-factory.ts';
 import { discoverOAuth, mintClientCredentialsToken, smokeTestMcp } from '../core/remote-mcp-probe.ts';
 
@@ -491,6 +491,20 @@ async function initMigrateOnly(opts: { jsonOutput: boolean }) {
     process.exit(1);
   }
 
+  // B.3: configureGateway BEFORE initSchema even on the migrate-only path,
+  // so a schema bump on a brain whose file config is missing the embedding
+  // fields doesn't fall through to stale hardcoded fallbacks. Reads
+  // existing config (which loadConfig already merged with env) and
+  // propagates it into the gateway.
+  const { configureGateway: configureGw } = await import('../core/ai/gateway.ts');
+  configureGw({
+    embedding_model: config.embedding_model,
+    embedding_dimensions: config.embedding_dimensions,
+    expansion_model: config.expansion_model,
+    chat_model: config.chat_model,
+    env: { ...process.env },
+  });
+
   const engine = await createEngine(toEngineConfig(config));
   try {
     await engine.connect(toEngineConfig(config));
@@ -659,6 +673,87 @@ async function initRemoteMcp(opts: {
   }
 }
 
+/**
+ * Configure the AI gateway with the merged precedence
+ * `CLI flags > env > existing file > gateway internal defaults`, then read
+ * back the resolved values so the caller can both print them and persist
+ * them to config.json.
+ *
+ * v0.37 fix wave (Lane B.1/B.2/B.3): pre-fix, the gateway was only configured
+ * when a flag was passed. Bare `gbrain init --pglite` left the gateway
+ * unconfigured and engine.initSchema() fell through to stale OpenAI/1536
+ * defaults — schema sized to 1536 while the ZE default emitted 1280. Now
+ * the gateway is ALWAYS configured before initSchema; the schema matches
+ * the resolved provider/dim out of the box.
+ */
+async function configureGatewayWithMergedPrecedence(
+  aiOpts?: { embedding_model?: string; embedding_dimensions?: number; expansion_model?: string; chat_model?: string },
+): Promise<{ embedding_model: string; embedding_dimensions: number; expansion_model: string; chat_model: string }> {
+  const existingFile = loadConfigFileOnly() ?? ({} as GBrainConfig);
+  // loadConfig() merges env on top of file — perfect for the gateway path,
+  // where env should win over a stale file. NOT used for the save path
+  // (see B.4), which uses loadConfigFileOnly so transient env state never
+  // pollutes config.json.
+  const envOverlay = loadConfig() ?? ({} as GBrainConfig);
+
+  const merged = {
+    embedding_model: aiOpts?.embedding_model ?? envOverlay.embedding_model ?? existingFile.embedding_model,
+    embedding_dimensions: aiOpts?.embedding_dimensions ?? envOverlay.embedding_dimensions ?? existingFile.embedding_dimensions,
+    expansion_model: aiOpts?.expansion_model ?? envOverlay.expansion_model ?? existingFile.expansion_model,
+    chat_model: aiOpts?.chat_model ?? envOverlay.chat_model ?? existingFile.chat_model,
+  };
+
+  const { configureGateway, getEmbeddingModel, getEmbeddingDimensions, getExpansionModel, getChatModel } = await import('../core/ai/gateway.ts');
+  configureGateway({
+    embedding_model: merged.embedding_model,
+    embedding_dimensions: merged.embedding_dimensions,
+    expansion_model: merged.expansion_model,
+    chat_model: merged.chat_model,
+    env: { ...process.env },
+  });
+
+  // Read back resolved values — gateway applies internal defaults for unset
+  // fields, so these are the values that actually shaped the schema.
+  return {
+    embedding_model: getEmbeddingModel(),
+    embedding_dimensions: getEmbeddingDimensions(),
+    expansion_model: getExpansionModel(),
+    chat_model: getChatModel(),
+  };
+}
+
+/**
+ * Print the resolved AI choice + a ZE setup hint when applicable.
+ */
+function printResolvedAIChoice(
+  resolved: { embedding_model: string; embedding_dimensions: number; expansion_model: string; chat_model: string },
+  aiOpts?: { embedding_model?: string },
+) {
+  const explicit = aiOpts?.embedding_model != null;
+  const label = explicit ? '' : ' [default]';
+  console.log(`  Embedding: ${resolved.embedding_model} (${resolved.embedding_dimensions}d)${label}`);
+  console.log(`  Expansion: ${resolved.expansion_model}`);
+  console.log(`  Chat:      ${resolved.chat_model}`);
+
+  // ZE setup hint: if resolved provider is ZE and no ZE key is set in env
+  // OR in the file plane, surface the setup gap at init time instead of
+  // letting the first embed call blow up. After Lane C, file-plane
+  // zeroentropy_api_key propagates through buildGatewayConfig.
+  if (resolved.embedding_model.startsWith('zeroentropyai:')) {
+    const fileCfg = loadConfigFileOnly();
+    if (!process.env.ZEROENTROPY_API_KEY && !fileCfg?.zeroentropy_api_key) {
+      console.warn('');
+      console.warn('  Heads up: ZEROENTROPY_API_KEY is not set.');
+      console.warn('  Set it before first embed:');
+      console.warn('    export ZEROENTROPY_API_KEY=...');
+      console.warn('  Or add to ~/.gbrain/config.json:');
+      console.warn('    "zeroentropy_api_key": "..."');
+      console.warn('  Or pick a different provider:');
+      console.warn('    gbrain init --pglite --embedding-model openai:text-embedding-3-large --embedding-dimensions 1536');
+    }
+  }
+}
+
 async function initPGLite(opts: {
   jsonOutput: boolean;
   apiKey: string | null;
@@ -668,11 +763,11 @@ async function initPGLite(opts: {
   const dbPath = opts.customPath || gbrainPath('brain.pglite');
   console.log(`Setting up local brain with PGLite (no server needed)...`);
 
-  // T6 (D11): preflight schema dim BEFORE any DB write or schema creation.
-  // After T5's env detection runs, opts.aiOpts has either an embedding_model
-  // resolved (auto-pick / picker / explicit flag) OR noEmbedding=true (D9
-  // opt-in). Either way we MUST agree with the gateway's resolved dim by
-  // construction — preflight validates that.
+  // v0.37.10.0 T6 (D11): preflight schema dim BEFORE any DB write or schema
+  // creation. After T5's env detection runs, opts.aiOpts has either an
+  // embedding_model resolved (auto-pick / picker / explicit flag) OR
+  // noEmbedding=true (D9 opt-in). Either way we MUST agree with the
+  // gateway's resolved dim by construction — preflight validates that.
   let resolvedDim: number | undefined;
   let resolvedModel: string | undefined;
   if (opts.aiOpts?.noEmbedding) {
@@ -699,9 +794,11 @@ async function initPGLite(opts: {
   // either means we have a user-passed combination the previous step accepted —
   // typically `--embedding-model` flag without env detection running.
 
-  // T6: always configureGateway BEFORE initSchema, never the conditional
-  // gate. This is the structural fix: schema substitution at
-  // pglite-schema.ts:833 and the runtime gateway share one source of truth.
+  // v0.37.10.0 T6 + v0.37.11.0 Lane B.1: ALWAYS configureGateway BEFORE
+  // initSchema. Schema substitution at pglite-schema.ts:833 and the runtime
+  // gateway share one source of truth. Resolution precedence locked in
+  // resolveAIOptions above: CLI flags > env vars > existing file > gateway
+  // defaults.
   const { configureGateway } = await import('../core/ai/gateway.ts');
   configureGateway({
     embedding_model: resolvedModel ?? opts.aiOpts?.embedding_model,
@@ -714,14 +811,34 @@ async function initPGLite(opts: {
   if (opts.aiOpts?.expansion_model) console.log(`  Expansion: ${opts.aiOpts.expansion_model}`);
   if (opts.aiOpts?.chat_model) console.log(`  Chat: ${opts.aiOpts.chat_model}`);
 
+  // v0.37.11.0 Lane C.3: surface ZE setup gap inline at init time when the
+  // resolved provider is ZeroEntropy and neither env nor file-plane key is
+  // set. Beats "first embed call blows up four minutes later" UX.
+  if (resolvedModel?.startsWith('zeroentropyai:')) {
+    const fileCfg = loadConfigFileOnly();
+    if (!process.env.ZEROENTROPY_API_KEY && !fileCfg?.zeroentropy_api_key) {
+      console.warn('');
+      console.warn('  Heads up: ZEROENTROPY_API_KEY is not set.');
+      console.warn('  Set it before first embed:');
+      console.warn('    export ZEROENTROPY_API_KEY=...');
+      console.warn('  Or add to ~/.gbrain/config.json:');
+      console.warn('    "zeroentropy_api_key": "..."');
+      console.warn('  Or pick a different provider:');
+      console.warn('    gbrain init --pglite --embedding-model openai:text-embedding-3-large --embedding-dimensions 1536');
+    }
+  }
+
   const engine = await createEngine({ engine: 'pglite' });
   try {
     await engine.connect({ database_path: dbPath, engine: 'pglite' });
 
-    // v0.28.5 (A4): refuse to silently re-template an existing brain with a
-    // mismatched embedding dimension. Loud failure beats the v0.27 silent-
-    // corruption pattern that surfaced as #673. (Re-init path; fresh-install
-    // case is now structurally impossible after T6's preflight.)
+    // v0.28.5 (A4) + v0.37.11.0 Lane B.5: refuse to silently re-template an
+    // existing brain with a mismatched embedding dimension. Catches both the
+    // explicit-flag case (v0.28.5) AND the bare-init case where a user with
+    // a 1536 brain runs `gbrain init --pglite` after upgrading to v0.36+
+    // and would silently end up with runtime ZE/1280 against a 1536 column
+    // (Lane B.5). Fresh-install case is now structurally impossible after
+    // v0.37.10.0 T6's preflight.
     if (resolvedDim) {
       const { readContentChunksEmbeddingDim, embeddingMismatchMessage } = await import('../core/embedding-dim-check.ts');
       const existing = await readContentChunksEmbeddingDim(engine);
@@ -731,6 +848,8 @@ async function initPGLite(opts: {
           requestedDims: resolvedDim,
           requestedModel: resolvedModel,
           source: 'init',
+          engineKind: 'pglite',
+          databasePath: dbPath,
         }) + '\n');
         if (opts.jsonOutput) {
           console.log(JSON.stringify({
@@ -746,10 +865,10 @@ async function initPGLite(opts: {
 
     await engine.initSchema();
 
-    // T6 (D11): post-initSchema invariant assertion. After preflight + always-
-    // configureGateway, this is structurally guaranteed to pass — kept as a
-    // regression guardrail so any future schema-substitution drift fails loud
-    // here, not at first embed.
+    // v0.37.10.0 T6 (D11): post-initSchema invariant assertion. After preflight
+    // + always-configureGateway, this is structurally guaranteed to pass —
+    // kept as a regression guardrail so any future schema-substitution drift
+    // fails loud here, not at first embed.
     if (resolvedDim) {
       const { readContentChunksEmbeddingDim, embeddingMismatchMessage } = await import('../core/embedding-dim-check.ts');
       const after = await readContentChunksEmbeddingDim(engine);
@@ -761,16 +880,24 @@ async function initPGLite(opts: {
           requestedDims: resolvedDim,
           requestedModel: resolvedModel,
           source: 'init',
+          engineKind: 'pglite',
+          databasePath: dbPath,
         }));
         process.exit(1);
       }
     }
 
-    // T7 (D9): atomic embedding-config persistence. Either the deferred-setup
-    // sentinel (`embedding_disabled: true`) OR the resolved (model, dimensions)
-    // tuple. Never a partial state. Other fields (api_key, expansion, chat)
-    // persist independently.
+    // v0.37.10.0 T7 (D9) + v0.37.11.0 Lane B.4: atomic embedding-config
+    // persistence on top of the existing file-plane config (preserves
+    // user-set fields like zeroentropy_api_key, chat_model, expansion_model).
+    // Either the deferred-setup sentinel (`embedding_disabled: true`) OR the
+    // resolved (model, dimensions) tuple. Never a partial state. Precedence:
+    // CLI flags this invocation > existing file plane > resolved defaults.
+    // Use loadConfigFileOnly() — loadConfig() would poison config.json with
+    // any DATABASE_URL the current process happens to have set (CDX2-7).
+    const existingFile = loadConfigFileOnly() ?? ({} as GBrainConfig);
     const config: GBrainConfig = {
+      ...existingFile,
       engine: 'pglite',
       database_path: dbPath,
       ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
@@ -834,7 +961,8 @@ async function initPostgres(opts: {
 }) {
   const { databaseUrl } = opts;
 
-  // T6 (D11): same preflight contract as PGLite. Refuse to call initSchema
+  // v0.37.10.0 T6 (D11) + v0.37.11.0 Lane B.2: ALWAYS configure gateway BEFORE
+  // initSchema. Same preflight contract as PGLite. Refuse to call initSchema
   // until the gateway-resolved dim is validated. Schema substitution in
   // src/schema.sql is currently a static `vector(1536)` for Postgres (unlike
   // PGLite's templated dim), so a Voyage/ZE-configured Postgres brain will
@@ -874,6 +1002,23 @@ async function initPostgres(opts: {
   if (resolvedModel) console.log(`  Embedding: ${resolvedModel} (${resolvedDim}d)`);
   if (opts.aiOpts?.expansion_model) console.log(`  Expansion: ${opts.aiOpts.expansion_model}`);
   if (opts.aiOpts?.chat_model) console.log(`  Chat: ${opts.aiOpts.chat_model}`);
+
+  // v0.37.11.0 Lane C.3: surface ZE setup gap inline at init time when the
+  // resolved provider is ZeroEntropy and neither env nor file-plane key is
+  // set. Beats "first embed call blows up four minutes later" UX.
+  if (resolvedModel?.startsWith('zeroentropyai:')) {
+    const fileCfg = loadConfigFileOnly();
+    if (!process.env.ZEROENTROPY_API_KEY && !fileCfg?.zeroentropy_api_key) {
+      console.warn('');
+      console.warn('  Heads up: ZEROENTROPY_API_KEY is not set.');
+      console.warn('  Set it before first embed:');
+      console.warn('    export ZEROENTROPY_API_KEY=...');
+      console.warn('  Or add to ~/.gbrain/config.json:');
+      console.warn('    "zeroentropy_api_key": "..."');
+      console.warn('  Or pick a different provider:');
+      console.warn('    gbrain init --pglite --embedding-model openai:text-embedding-3-large --embedding-dimensions 1536');
+    }
+  }
 
   // Detect Supabase direct connection URLs and warn about IPv6
   if (databaseUrl.match(/db\.[a-z]+\.supabase\.co/) || databaseUrl.includes('.supabase.co:5432')) {
@@ -920,8 +1065,11 @@ async function initPostgres(opts: {
       // Non-fatal
     }
 
-    // v0.28.5 (A4): refuse to silently re-template an existing brain with a
-    // mismatched embedding dimension (mirror of the PGLite path above).
+    // v0.28.5 (A4) + v0.37.11.0 Lane B.5: refuse to silently re-template an
+    // existing brain with a mismatched embedding dimension. Mirror of the
+    // PGLite path above. Fires even when the user didn't pass
+    // `--embedding-dimensions` explicitly so the Lane B.5 bare-init case is
+    // covered too.
     if (resolvedDim) {
       const { readContentChunksEmbeddingDim, embeddingMismatchMessage } = await import('../core/embedding-dim-check.ts');
       const existing = await readContentChunksEmbeddingDim(engine);
@@ -931,6 +1079,7 @@ async function initPostgres(opts: {
           requestedDims: resolvedDim,
           requestedModel: resolvedModel,
           source: 'init',
+          engineKind: 'postgres',
         }) + '\n');
         if (opts.jsonOutput) {
           console.log(JSON.stringify({
@@ -947,7 +1096,7 @@ async function initPostgres(opts: {
     console.log('Running schema migration...');
     await engine.initSchema();
 
-    // T6 (D11): post-initSchema invariant assertion guardrail.
+    // v0.37.10.0 T6 (D11): post-initSchema invariant assertion guardrail.
     if (resolvedDim) {
       const { readContentChunksEmbeddingDim, embeddingMismatchMessage } = await import('../core/embedding-dim-check.ts');
       const after = await readContentChunksEmbeddingDim(engine);
@@ -959,15 +1108,21 @@ async function initPostgres(opts: {
           requestedDims: resolvedDim,
           requestedModel: resolvedModel,
           source: 'init',
+          engineKind: 'postgres',
         }));
         process.exit(1);
       }
     }
 
-    // T7 (D9): atomic embedding-config persistence.
+    // v0.37.10.0 T7 (D9) + v0.37.11.0 Lane B.4 (Postgres mirror): atomic
+    // embedding-config persistence on top of the existing file-plane config.
+    // Same precedence + same merge contract as the PGLite path above.
+    const existingFile = loadConfigFileOnly() ?? ({} as GBrainConfig);
     const config: GBrainConfig = {
+      ...existingFile,
       engine: 'postgres',
       database_url: databaseUrl,
+      database_path: undefined, // clear any stale PGLite path
       ...(opts.apiKey ? { openai_api_key: opts.apiKey } : {}),
       ...(opts.aiOpts?.noEmbedding
         ? { embedding_disabled: true }

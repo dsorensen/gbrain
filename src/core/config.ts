@@ -31,7 +31,17 @@ export interface GBrainConfig {
   database_path?: string;
   openai_api_key?: string;
   anthropic_api_key?: string;
-  /** AI gateway config (v0.14+). Default: "openai:text-embedding-3-large" / 1536 / "anthropic:claude-haiku-4-5-20251001". */
+  /**
+   * ZeroEntropy API key. v0.37 fix wave (CDX2-5+6): ZE became the default
+   * embedding + reranker provider in v0.36 but lacked a file-plane config
+   * slot. `gbrain config set zeroentropy_api_key X` wrote DB plane,
+   * `loadConfig` only merged OpenAI/Anthropic, and `buildGatewayConfig`
+   * at cli.ts:1401 only mapped those two — so the key never reached the
+   * embed pipeline. Now wired through: file plane → loadConfig env
+   * merge → buildGatewayConfig env dict → recipe reads ZEROENTROPY_API_KEY.
+   */
+  zeroentropy_api_key?: string;
+  /** AI gateway config (v0.14+). v0.36+ default: "zeroentropyai:zembed-1" / 1280 / "anthropic:claude-haiku-4-5-20251001". */
   embedding_model?: string;
   embedding_dimensions?: number;
   /**
@@ -175,6 +185,29 @@ function migrateLegacyEmbeddingConfig(raw: Record<string, unknown>): Record<stri
   return rest;
 }
 
+/**
+ * File-only config loader. Reads ~/.gbrain/config.json and applies the
+ * legacy embedding-config migration shim. Does NOT merge env vars, does
+ * NOT infer engine kind from DATABASE_URL.
+ *
+ * Used by `gbrain init`'s config-merge path (B.4) where loading
+ * `loadConfig()` would poison the saved file with transient env state
+ * (e.g. a CI run with DATABASE_URL set writes a Postgres config.json
+ * for a PGLite brain). Read-path callers should keep using `loadConfig()`
+ * because env vars are the canonical operator escape hatch at runtime.
+ *
+ * v0.37 fix wave (CDX-5 from round 1). Pinned by test/config-file-only-loader.test.ts.
+ */
+export function loadConfigFileOnly(): GBrainConfig | null {
+  try {
+    const raw = readFileSync(getConfigPath(), 'utf-8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return migrateLegacyEmbeddingConfig(parsed) as unknown as GBrainConfig;
+  } catch {
+    return null;
+  }
+}
+
 export function loadConfig(): GBrainConfig | null {
   let fileConfig: GBrainConfig | null = null;
   try {
@@ -206,6 +239,7 @@ export function loadConfig(): GBrainConfig | null {
     ...(dbUrl ? { database_path: undefined } : {}),
     ...(process.env.OPENAI_API_KEY ? { openai_api_key: process.env.OPENAI_API_KEY } : {}),
     ...(process.env.ANTHROPIC_API_KEY ? { anthropic_api_key: process.env.ANTHROPIC_API_KEY } : {}),
+    ...(process.env.ZEROENTROPY_API_KEY ? { zeroentropy_api_key: process.env.ZEROENTROPY_API_KEY } : {}),
     ...(process.env.GBRAIN_EMBEDDING_MODEL ? { embedding_model: process.env.GBRAIN_EMBEDDING_MODEL } : {}),
     ...(process.env.GBRAIN_EMBEDDING_DIMENSIONS ? { embedding_dimensions: parseInt(process.env.GBRAIN_EMBEDDING_DIMENSIONS, 10) } : {}),
     ...(process.env.GBRAIN_EXPANSION_MODEL ? { expansion_model: process.env.GBRAIN_EXPANSION_MODEL } : {}),

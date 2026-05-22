@@ -283,13 +283,16 @@ gbrain init --pglite \
 `voyage-code-3` is Voyage's code-specialized embedding model with
 head-to-head numbers above their general flagships on code retrieval
 ([voyageai.com/blog](https://voyageai.com/blog)). For already-initialized
-brains, switch later:
+brains, switch with the one-command wipe-and-reinit (preserves every
+other config field):
 
 ```bash
-gbrain config set embedding_model voyage:voyage-code-3
-gbrain config set embedding_dimensions 1024
+gbrain reinit-pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
 gbrain reindex --code --yes
 ```
+
+(`gbrain config set embedding_model` is refused as of v0.37.11.0 because
+the schema column has to resize alongside the config.)
 
 `gbrain reindex --code` prints a recommendation when the configured
 embedding model isn't code-tuned. Suppress with

@@ -22,6 +22,7 @@
  */
 
 import { applyChunkEmbeddingIndexPolicy } from './vector-index.ts';
+import { DEFAULT_EMBEDDING_MODEL, DEFAULT_EMBEDDING_DIMENSIONS } from './ai/defaults.ts';
 
 const PGLITE_SCHEMA_SQL_TEMPLATE = `
 -- GBrain PGLite schema (local embedded Postgres)
@@ -828,9 +829,16 @@ DROP FUNCTION IF EXISTS update_page_search_vector_from_timeline();
 
 /**
  * Return the PGLite schema SQL with embedding vector dim + model name substituted.
- * Defaults preserve v0.13 behavior (1536d + text-embedding-3-large).
+ * Defaults come from the AI gateway (v0.36+: zeroentropyai:zembed-1 / 1280d).
+ *
+ * v0.37.x fix wave: defaults track gateway constants instead of stale v0.13
+ * OpenAI literals so the pre-computed `PGLITE_SCHEMA_SQL` constant doesn't
+ * size the column to 1536 while the runtime default model emits 1280.
  */
-export function getPGLiteSchema(dims: number = 1536, model: string = 'text-embedding-3-large'): string {
+export function getPGLiteSchema(
+  dims: number = DEFAULT_EMBEDDING_DIMENSIONS,
+  model: string = DEFAULT_EMBEDDING_MODEL,
+): string {
   const parsedDims = Number(dims);
   if (!Number.isInteger(parsedDims) || parsedDims <= 0) {
     throw new Error(`Invalid embedding dimensions: ${dims}`);

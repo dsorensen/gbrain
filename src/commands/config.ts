@@ -106,10 +106,47 @@ export async function runConfig(engine: BrainEngine, args: string[]) {
       process.exit(1);
     }
   } else if (action === 'set' && key && value) {
-    // v0.37 (D6): strict unknown-key rejection with --force escape hatch.
-    // Catches the silent-no-op class the bug reporter hit (`embedding.provider`,
-    // `embedding.model`, `embedding.dimensions` all accepted today). Levenshtein
-    // suggests the canonical key when one is within edit distance ≤ 3.
+    // v0.37.11.0 fix wave (Lane C.2 + CDX2-13): refuse writes to schema-sizing
+    // fields unconditionally. These fields size the `content_chunks.embedding`
+    // column at init time and are file-plane canonical. `gbrain config set
+    // embedding_model X` writes the DB plane, which the embed pipeline
+    // never reads — silent lie that took users hours to diagnose.
+    //
+    // No `--force` escape hatch (CDX2-13): keeping a known-no-op DB-only
+    // write preserves the split-brain footgun the wave exists to close.
+    // Switching providers requires wipe-and-reinit; the recipe below is
+    // paste-ready and uses the actual command path that works after Lane B.
+    if (key === 'embedding_model' || key === 'embedding_dimensions') {
+      const { gbrainPath } = await import('../core/config.ts');
+      const isPgliteEngine = (await import('../core/config.ts')).loadConfig()?.engine === 'pglite';
+      const dbPath = gbrainPath('brain.pglite');
+      console.error(`[config] ${key} is a file-plane field that sizes the schema.`);
+      console.error(`[config] Setting it in the DB has no effect on the embed pipeline (silent no-op).`);
+      console.error(`[config]`);
+      if (isPgliteEngine) {
+        console.error(`[config] To switch embedding models/dimensions on PGLite, wipe and re-init:`);
+        console.error(`[config]   mv ${dbPath} ${dbPath}.bak`);
+        if (key === 'embedding_model') {
+          console.error(`[config]   gbrain init --pglite --embedding-model ${value}`);
+        } else {
+          console.error(`[config]   gbrain init --pglite --embedding-dimensions ${value}`);
+        }
+        console.error(`[config]   gbrain sync   # re-imports your brain repo`);
+      } else {
+        console.error(`[config] To switch embedding models/dimensions on Postgres, see:`);
+        console.error(`[config]   docs/embedding-migrations.md`);
+      }
+      console.error(`[config]`);
+      console.error(`[config] No --force escape: silently writing a no-op preserves the bug class this rejection closes.`);
+      process.exit(1);
+    }
+
+    // v0.37.10.0 (D6): strict unknown-key rejection with --force escape hatch.
+    // Catches the silent-no-op class for namespaced typos like `embedding.provider`,
+    // `embedding.model`, `embedding.dimensions` — Levenshtein suggests the canonical
+    // key (`embedding_model`, `embedding_dimensions`) when one is within edit
+    // distance ≤ 3, after which the v0.37.11.0 hard-refuse above kicks in for those
+    // specific schema-sizing fields.
     const forceFlag = args.includes('--force');
     if (!forceFlag) {
       const { KNOWN_CONFIG_KEYS, KNOWN_CONFIG_KEY_PREFIXES } = await import('../core/config.ts');

@@ -82,12 +82,13 @@ Best-in-class quality on the Voyage 4 family (Jan 2026 release). Set `VOYAGE_API
 
 Voyage 4 family shares an embedding space across all variants, so you can index with `voyage-4-large` and query with `voyage-4-lite` without reindexing. Dims: 256, 512, 1024, 2048. **2048 exceeds pgvector's HNSW cap of 2000** — those brains fall back to exact vector scans (still correct, just slower).
 
-**For brains that index source code** (gstack's per-worktree pglite-backed code brain — see Topology 3 in `docs/architecture/topologies.md`), prefer `voyage-code-3` over `voyage-4-large`. Voyage tunes it on programming languages and publishes head-to-head numbers vs their general flagships on code retrieval. Configure with:
+**For brains that index source code** (gstack's per-worktree pglite-backed code brain — see Topology 3 in `docs/architecture/topologies.md`), prefer `voyage-code-3` over `voyage-4-large`. Voyage tunes it on programming languages and publishes head-to-head numbers vs their general flagships on code retrieval. Configure at install time:
 
 ```bash
-gbrain config set embedding_model voyage:voyage-code-3
-gbrain config set embedding_dimensions 1024
+gbrain init --pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024
 ```
+
+To switch an existing brain, use `gbrain reinit-pglite --embedding-model voyage:voyage-code-3 --embedding-dimensions 1024` (PGLite) or follow `docs/embedding-migrations.md` (Postgres). `gbrain config set embedding_model` is refused — the schema column has to resize.
 
 `gbrain reindex --code` will print a recommendation when run against a brain whose configured embedding model isn't code-tuned; suppress with `GBRAIN_NO_CODE_MODEL_NUDGE=1` if you've intentionally chosen another model (single-vendor procurement, compliance, etc.).
 
@@ -173,10 +174,13 @@ Four options:
 
 ## Switching providers on an existing brain
 
-Embedding dimensions are baked into the schema at `gbrain init` time. To change providers post-init, you usually need to re-embed:
+Embedding dimensions are baked into the schema at `gbrain init` time. As of v0.37.11.0, `gbrain config set embedding_model` and `gbrain config set embedding_dimensions` are refused — the schema column has to resize alongside the config, and `config set` only touches the config row.
 
-1. Update config: `gbrain config set embedding_model <provider>:<model>` and `embedding_dimensions <N>`.
-2. Reindex schema if dims changed: `gbrain doctor` will detect the mismatch and print the exact `ALTER TABLE` recipe.
-3. Re-embed: `gbrain embed --all` (or `--stale` for incremental).
+The supported paths:
+
+- **PGLite (default install):** `gbrain reinit-pglite --embedding-model <provider>:<model> --embedding-dimensions <N>` — one-command wipe-and-reinit that preserves every other config field (chat model, expansion model, API keys), backs up the prior brain to `<path>.bak`, runs `gbrain init` with the new flags, and re-syncs your brain repo. Add `--no-sync` to skip the resync, `--yes` to skip the TTY confirmation, `--json` for scripts.
+- **Postgres (Supabase / self-hosted):** follow the SQL recipe in `docs/embedding-migrations.md` (drop the HNSW index, ALTER COLUMN TYPE, clear stale embeddings, recreate the index conditionally, then `gbrain init --supabase --embedding-model X --embedding-dimensions N` to update the file plane and re-embed).
+
+`gbrain doctor` 8c "alternative_providers" surfaces unconfigured providers whose env is already set — useful when you've configured OpenAI but also have e.g. `VOYAGE_API_KEY` exported and want to know you can switch without extra setup.
 
 `gbrain doctor` 8c "alternative_providers" surfaces unconfigured providers whose env is already set — useful when you've configured OpenAI but also have e.g. `VOYAGE_API_KEY` exported and want to know you can switch without extra setup.

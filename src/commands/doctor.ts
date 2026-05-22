@@ -974,7 +974,14 @@ export async function checkBrainstormHealth(engine: BrainEngine): Promise<Check>
  */
 export async function checkZeEmbeddingHealth(engine: BrainEngine): Promise<Check> {
   try {
-    const model = await engine.getConfig('embedding_model') ?? '';
+    // v0.37 fix wave (Lane E.3 + CDX2-10): read from gateway, not DB.
+    // The file plane is canonical post-v0.37; the DB config table is
+    // schema-applied metadata. Reading DB here would skip the warning
+    // when the user has a fresh install with no DB config row yet.
+    const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
+    const { loadConfigFileOnly } = await import('../core/config.ts');
+    let model = '';
+    try { model = getEmbeddingModel(); } catch { /* gateway unconfigured */ }
     if (!model.startsWith('zeroentropyai:')) {
       return {
         name: 'ze_embedding_health',
@@ -983,15 +990,17 @@ export async function checkZeEmbeddingHealth(engine: BrainEngine): Promise<Check
       };
     }
     const envKey = process.env.ZEROENTROPY_API_KEY;
-    const configKey = await engine.getConfig('zeroentropy_api_key');
-    if (!envKey && !configKey) {
+    // File plane: zeroentropy_api_key on GBrainConfig (added by C.3).
+    const fileKey = loadConfigFileOnly()?.zeroentropy_api_key;
+    if (!envKey && !fileKey) {
       return {
         name: 'ze_embedding_health',
         status: 'warn',
         message:
           `embedding_model="${model}" but ZEROENTROPY_API_KEY is not set. ` +
-          `Fix: get a key at https://dashboard.zeroentropy.dev and run ` +
-          `\`gbrain config set zeroentropy_api_key <YOUR_KEY>\` (or export ZEROENTROPY_API_KEY).`,
+          `Fix: get a key at https://dashboard.zeroentropy.dev and either ` +
+          `\`export ZEROENTROPY_API_KEY=...\` or edit ~/.gbrain/config.json ` +
+          `to add "zeroentropy_api_key": "...". (gbrain config set writes the DB plane, which the embed pipeline ignores.)`,
       };
     }
     return {
@@ -1020,68 +1029,75 @@ export async function checkZeEmbeddingHealth(engine: BrainEngine): Promise<Check
  */
 export async function checkEmbeddingWidthConsistency(engine: BrainEngine): Promise<Check> {
   try {
-    const configDimStr = await engine.getConfig('embedding_dimensions');
-    if (!configDimStr) {
-      // Pre-v0.27 brain or never configured. Not our problem.
+    // v0.37 fix wave (Lane E.1 + CDX-8): read from gateway, not DB. The
+    // file plane is canonical post-v0.37; the DB config table is
+    // schema-applied metadata. Reading DB here silently skipped the
+    // check on fresh installs whose DB config row hadn't been written
+    // yet.
+    const { getEmbeddingDimensions, getEmbeddingModel } = await import('../core/ai/gateway.ts');
+    let configDim: number;
+    let resolvedModel: string;
+    try {
+      configDim = getEmbeddingDimensions();
+      resolvedModel = getEmbeddingModel();
+    } catch {
       return {
         name: 'embedding_width_consistency',
         status: 'ok',
-        message: 'embedding_dimensions not configured — using defaults.',
+        message: 'gateway not configured — skipping width check.',
       };
     }
-    const configDim = parseInt(configDimStr, 10);
     if (!Number.isFinite(configDim) || configDim <= 0) {
       return {
         name: 'embedding_width_consistency',
         status: 'warn',
-        message: `embedding_dimensions config value "${configDimStr}" is not a positive integer. Fix: \`gbrain config set embedding_dimensions <N>\`.`,
+        message: `gateway returned non-positive embedding dimension "${configDim}".`,
       };
     }
 
-    // Read the actual column width from pg_attribute / information_schema.
-    // Postgres + PGLite both expose vector typmod via atttypmod (vectors
-    // store dim as typmod). atttypmod==-1 means no constraint; >=0 is the
-    // dim+VARHDRSZ — we use format_type for portability.
-    const rows = await engine.executeRaw<{ format_type: string }>(
-      `SELECT format_type(atttypid, atttypmod) AS format_type
-         FROM pg_attribute
-        WHERE attrelid = 'content_chunks'::regclass
-          AND attname = 'embedding'
-          AND NOT attisdropped`,
-    );
-    if (rows.length === 0) {
+    // Read the actual column width via the existing helper (shared with
+    // init.ts and embed.ts dim-mismatch pre-flight). One source of truth.
+    const { readContentChunksEmbeddingDim, embeddingMismatchMessage } = await import('../core/embedding-dim-check.ts');
+    const existing = await readContentChunksEmbeddingDim(engine);
+    if (!existing.exists) {
       return {
         name: 'embedding_width_consistency',
         status: 'warn',
         message: 'content_chunks.embedding column not found. Fix: run `gbrain init --migrate-only` or check schema.',
       };
     }
-    const formatType = rows[0].format_type;
-    // Parse 'vector(N)' shape.
-    const m = formatType.match(/vector\((\d+)\)/i);
-    if (!m) {
+    if (existing.dims === null) {
       return {
         name: 'embedding_width_consistency',
         status: 'warn',
-        message: `Unexpected column type for content_chunks.embedding: "${formatType}".`,
+        message: 'content_chunks.embedding is not a vector type. Schema may be corrupt.',
       };
     }
-    const schemaDim = parseInt(m[1], 10);
-    if (schemaDim !== configDim) {
+    if (existing.dims !== configDim) {
+      // E.2: use the engine-kind-branched recipe instead of pointing at
+      // the no-op `gbrain config set` path. The recipe is paste-ready
+      // for the brain's actual engine.
+      const databasePath = (engine as { _savedConfig?: { database_path?: string } })._savedConfig?.database_path;
+      const recipe = embeddingMismatchMessage({
+        currentDims: existing.dims,
+        requestedDims: configDim,
+        requestedModel: resolvedModel,
+        source: 'doctor',
+        engineKind: engine.kind,
+        databasePath,
+      });
       return {
         name: 'embedding_width_consistency',
         status: 'warn',
         message:
-          `Schema width mismatch: content_chunks.embedding is vector(${schemaDim}) but ` +
-          `embedding_dimensions config = ${configDim}. ` +
-          `Fix: \`gbrain ze-switch --resume\` if you were mid-switch, or ` +
-          `\`gbrain config set embedding_dimensions ${schemaDim}\` to match the schema.`,
+          `Schema width mismatch: content_chunks.embedding is vector(${existing.dims}) but ` +
+          `gateway resolved embedding_dimensions = ${configDim}.\n\n${recipe}`,
       };
     }
     return {
       name: 'embedding_width_consistency',
       status: 'ok',
-      message: `Schema width (${schemaDim}d) matches embedding_dimensions config`,
+      message: `Schema width (${existing.dims}d) matches gateway embedding_dimensions`,
     };
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -4373,15 +4389,56 @@ export async function runRemediate(
  * Pure read; no side effects.
  */
 async function loadRecommendationContext(engine: BrainEngine) {
+  // v0.37 fix wave (Lane E.4 + CDX2-11): read schema-sizing fields from
+  // gateway, not DB. The DB plane is schema-applied metadata; the file
+  // plane is the gateway runtime source. Pre-fix this context produced
+  // stale recommendations on fresh installs whose DB rows hadn't been
+  // populated.
+  //
+  // Also extended the API-key check to recognize the ZE key alongside
+  // OpenAI (was OpenAI-only). After Lane C.3, zeroentropy_api_key lives
+  // in GBrainConfig + propagates to the gateway env dict.
   const repoPath = await engine.getConfig('sync.repo_path');
-  const embeddingModel = await engine.getConfig('embedding_model');
-  const embeddingDimensions = await engine.getConfig('embedding_dimensions');
+  let embeddingModel: string | undefined;
+  let embeddingDimensions: number | undefined;
+  try {
+    const gw = await import('../core/ai/gateway.ts');
+    embeddingModel = gw.getEmbeddingModel();
+    embeddingDimensions = gw.getEmbeddingDimensions();
+  } catch {
+    // Gateway unconfigured — fall back to DB plane as a best-effort hint
+    // (preserves doctor running before any engine.connect()).
+    const dbModel = await engine.getConfig('embedding_model');
+    const dbDims = await engine.getConfig('embedding_dimensions');
+    embeddingModel = dbModel ?? undefined;
+    embeddingDimensions = dbDims ? Number(dbDims) : undefined;
+  }
+  // Provider-aware key check. The active embedding provider determines
+  // which key matters. Pre-fix this was OpenAI-only, so a ZE brain with
+  // OPENAI_API_KEY set looked "healthy" even though no key reached ZE.
+  const { loadConfigFileOnly } = await import('../core/config.ts');
+  const fileCfg = loadConfigFileOnly();
+  let hasEmbeddingApiKey = false;
+  if (embeddingModel?.startsWith('openai:')) {
+    hasEmbeddingApiKey = !!(process.env.OPENAI_API_KEY || fileCfg?.openai_api_key);
+  } else if (embeddingModel?.startsWith('zeroentropyai:')) {
+    hasEmbeddingApiKey = !!(process.env.ZEROENTROPY_API_KEY || fileCfg?.zeroentropy_api_key);
+  } else {
+    // Voyage / generic openai-compatible / unknown provider — fall back
+    // to "any key present" as the legacy hint.
+    hasEmbeddingApiKey = !!(
+      process.env.OPENAI_API_KEY ||
+      process.env.ZEROENTROPY_API_KEY ||
+      fileCfg?.openai_api_key ||
+      fileCfg?.zeroentropy_api_key
+    );
+  }
   return {
     repoPath: repoPath ?? undefined,
-    embeddingModel: embeddingModel ?? undefined,
-    embeddingDimensions: embeddingDimensions ? Number(embeddingDimensions) : undefined,
-    hasEmbeddingApiKey: !!(process.env.OPENAI_API_KEY || await engine.getConfig('openai_api_key')),
-    hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || await engine.getConfig('anthropic_api_key')),
+    embeddingModel,
+    embeddingDimensions,
+    hasEmbeddingApiKey,
+    hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || fileCfg?.anthropic_api_key),
   };
 }
 
