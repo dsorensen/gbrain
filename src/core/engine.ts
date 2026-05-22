@@ -437,6 +437,14 @@ export interface NewFact {
   claim_value?: number | null;
   claim_unit?: string | null;
   claim_period?: string | null;
+  /**
+   * v0.40.2.0 — event-shaped row marker ('meeting', 'job_change',
+   * 'location_change', etc). Mutually informational with `claim_metric`:
+   * a row can have either, both, or neither. Persisted into
+   * `facts.event_type` (migration v81). Existing callers don't need to
+   * set this — leaving it undefined preserves pre-v0.40 behavior.
+   */
+  event_type?: string | null;
 }
 
 /** Options shared by list-facts methods. */

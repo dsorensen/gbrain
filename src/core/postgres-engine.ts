@@ -2742,6 +2742,8 @@ export class PostgresEngine implements BrainEngine {
         const claimValue  = input.claim_value  ?? null;
         const claimUnit   = input.claim_unit   ?? null;
         const claimPeriod = input.claim_period ?? null;
+        // v0.40.2.0 — event_type column (Commit 1 migration v81).
+        const eventType   = input.event_type   ?? null;
 
         const ins = await tx<Array<{ id: number }>>`
           INSERT INTO facts (
@@ -2749,13 +2751,15 @@ export class PostgresEngine implements BrainEngine {
             valid_from, valid_until, source, source_session, confidence,
             embedding, embedded_at,
             row_num, source_markdown_slug,
-            claim_metric, claim_value, claim_unit, claim_period
+            claim_metric, claim_value, claim_unit, claim_period,
+            event_type
           ) VALUES (
             ${ctx.source_id}, ${entitySlug}, ${input.fact}, ${kind}, ${visibility}, ${notability}, ${context},
             ${validFrom}, ${validUntil}, ${input.source}, ${sourceSession}, ${confidence},
             ${embedLit === null ? null : tx.unsafe(`'${embedLit}'::vector`)}, ${embeddedAt},
             ${input.row_num}, ${input.source_markdown_slug},
-            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod}
+            ${claimMetric}, ${claimValue}, ${claimUnit}, ${claimPeriod},
+            ${eventType}
           ) RETURNING id
         `;
         out.push(Number(ins[0].id));
