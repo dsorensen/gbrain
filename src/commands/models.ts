@@ -161,7 +161,7 @@ type ProbeStatus = 'ok' | 'model_not_found' | 'auth' | 'rate_limit' | 'network' 
 
 interface ProbeResult {
   model: string;
-  touchpoint: 'chat' | 'expansion' | 'embedding_config' | 'reranker_config';
+  touchpoint: 'chat' | 'expansion' | 'embedding_config' | 'embedding_reachability' | 'reranker_config';
   status: ProbeStatus;
   message: string;
   elapsed_ms: number;
@@ -439,6 +439,50 @@ async function probeRerankerReachability(engine: BrainEngine): Promise<ProbeResu
   }
 }
 
+/**
+ * v0.40.x: embedding reachability probe. Mirrors probeRerankerReachability —
+ * sends a real 1-input `embed(['probe'])` to verify the configured embedding
+ * provider actually answers (auth + URL + model loaded). probeEmbeddingConfig
+ * is zero-network and only validates dims/recipe shape; for LOCAL providers
+ * (ollama, llama-server) it can't tell whether the server is up, so a dead or
+ * embedding-mode-off endpoint was previously only discovered at first real
+ * embed. Caller gates this on probeEmbeddingConfig returning 'ok' so a config
+ * failure isn't reported twice.
+ *
+ * Cold-start note: a local CPU embedder loading a model on first call can take
+ * several seconds; the 5s timeout may trip on the very first probe. Re-run if so.
+ */
+async function probeEmbeddingReachability(): Promise<ProbeResult | null> {
+  const { getEmbeddingModel, embed } = await import('../core/ai/gateway.ts');
+  const modelStr = getEmbeddingModel();
+  if (!modelStr) return null;
+
+  const start = Date.now();
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(new Error('probe timed out after 5s')), 5000);
+  try {
+    await embed(['probe'], { inputType: 'query', abortSignal: controller.signal });
+    return {
+      model: modelStr,
+      touchpoint: 'embedding_reachability',
+      status: 'ok',
+      message: 'reachable',
+      elapsed_ms: Date.now() - start,
+    };
+  } catch (err) {
+    const { status, message } = classifyError(err);
+    return {
+      model: modelStr,
+      touchpoint: 'embedding_reachability',
+      status,
+      message,
+      elapsed_ms: Date.now() - start,
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 async function probeModel(modelStr: string, touchpoint: 'chat' | 'expansion'): Promise<ProbeResult> {
   const start = Date.now();
   try {
@@ -519,7 +563,8 @@ Tiers: utility (haiku-class) | reasoning (sonnet) | deep (opus) | subagent (Anth
   // Config-only probe runs first: zero tokens, catches the bug class where a
   // brain misconfigured for Voyage with the wrong embedding_dimensions would
   // 400 on first embed. Fast feedback before we spend a single token.
-  results.push(await probeEmbeddingConfig());
+  const embeddingConfig = await probeEmbeddingConfig();
+  results.push(embeddingConfig);
   // v0.35.0.0+ reranker config probe — same zero-network model as embedding.
   // v0.40.6.1: takes the engine so it can read the same `search.reranker.*`
   // config keys live search reads (closes file-plane / DB-plane divergence).
@@ -533,8 +578,17 @@ Tiers: utility (haiku-class) | reasoning (sonnet) | deep (opus) | subagent (Anth
     results.push(await probeModel(modelStr, touchpoint));
   }
 
-  // v0.40.6.1: reachability uses the live-search resolution path; only fires
-  // when reranker is actually enabled (per the resolved mode bundle).
+  // v0.40.x: embedding reachability — only when the config probe passed
+  // (codex #8: a config failure shouldn't be reported twice) AND the provider
+  // isn't in --skip. Catches a dead/misconfigured LOCAL embed server early.
+  if (embeddingConfig.status === 'ok' && !shouldSkipProvider(embeddingConfig.model, skip)) {
+    const er = await probeEmbeddingReachability();
+    if (er) results.push(er);
+  }
+
+  // v0.40.6.1: reranker reachability uses the live-search resolution path
+  // (file-plane / DB-plane divergence fix); only fires when reranker is
+  // actually enabled per the resolved mode bundle.
   const liveRerankerModel = await resolveLiveRerankerModel(engine);
   if (liveRerankerModel && !shouldSkipProvider(liveRerankerModel, skip)) {
     const r = await probeRerankerReachability(engine);
