@@ -573,6 +573,15 @@ function formatResult(opName: string, result: unknown): string {
     case 'query': {
       const results = result as any[];
       if (results.length === 0) return 'No results.\n';
+      // v0.40.4 — --explain switches to per-stage attribution formatter.
+      // Reads CliOptions.explain via the module-level singleton.
+      const cliOpts = getCliOptions();
+      if (cliOpts.explain) {
+        // Lazy import keeps formatResult's startup hot path narrow for
+        // the common non-explain case.
+        const { formatResultsExplain } = require('./core/search/explain-formatter.ts');
+        return formatResultsExplain(results);
+      }
       return results.map(r =>
         `[${r.score?.toFixed(4) || '?'}] ${r.slug} -- ${r.chunk_text?.slice(0, 100) || ''}${r.stale ? ' (stale)' : ''}`,
       ).join('\n') + '\n';
