@@ -235,6 +235,56 @@ loadActivePack — v0.40.6.0 closed the cross-process invalidation gap).
 - Query paths (`whoknows`, `find_experts`) now route through the new
   expert types.
 
+## Contract
+
+- **Inputs:** a natural-language request that names a type / prefix / link verb / flag change, OR the result of `gbrain schema review-orphans` showing untyped pages that need a new type.
+- **Outputs:** mutated pack file at `~/.gbrain/schema-packs/<name>/pack.{json,yaml}` + an audit row in `~/.gbrain/audit/schema-mutations-YYYY-Www.jsonl` + (if `sync --apply` ran) backfilled `pages.type` on matching rows.
+- **Side effects:** invalidates the in-process pack cache + the query cache for the source. Other processes pick up the change within 1 second (stat-mtime TTL).
+- **Idempotency:** every primitive is idempotent. `add-alias`/`add-prefix` no-op on duplicate; `sync --apply` finds nothing to update on second run.
+- **Trust:** CLI = local trust (no scope check). MCP = OAuth `admin` scope (write ops). Audit log captures `actor: mcp:<clientId8>` per mutation.
+- **Atomicity:** every mutation is wrapped in `withMutation`'s atomic write (`.tmp + fsync + rename`) + per-pack `O_CREAT|O_EXCL` lock. Crash mid-write leaves the original file untouched.
+
+## Anti-Patterns
+
+- **Don't mutate `gbrain-base` or `gbrain-recommended`.** Fork first (`gbrain schema fork gbrain-base mine`). These are bundled packs; edits would be lost on upgrade. The mutation primitives refuse with `PACK_READONLY`.
+- **Don't add a type for a directory you imported once for triage.** Pack types are permanent decisions; one-time imports are not. See `skills/conventions/schema-evolution.md` for the <20-pages-don't-pack-codify heuristic.
+- **Don't add `--expert` to a type with no `path_prefixes`.** The `expert_routing_without_prefix` lint warns about this — expert-routed types with no prefix never match a put_page inference, so `whoknows` silently never surfaces them.
+- **Don't promote a `schema suggest` candidate without verifying the prefix matches real content.** Run `lint --with-db` before `add-type` to catch prefix collisions pre-write.
+- **Don't conflate "filing one page" with "evolving the schema."** Filing routes via `brain-taxonomist`; schema-author is for authoring the type taxonomy itself. The Non-goals section above names the boundary.
+- **Don't skip the dry-run before `sync --apply`.** Always run `sync` first to see `would_apply` counts + sample slugs. A pack prefix that matches 50,000 pages is recoverable but slow; verifying first is cheap.
+- **Don't remove a type without checking references.** `remove-type` refuses with `STILL_REFERENCED` if another type's `aliases` / `enrichable_types` / `link_types` / `frontmatter_links` references it. Break the references first; don't add `--force`.
+
+## Output Format
+
+When invoked, this skill produces structured output suitable for both human + JSON consumption:
+
+**Per-mutation result (JSON):**
+```json
+{"schema_version": 1, "pack": "mine", "path": "/Users/.../pack.json", "format": "json", "prev_sha8": "a1b2c3d4", "new_sha8": "e5f6g7h8"}
+```
+
+**Per-batch result (from `schema_apply_mutations` MCP op):**
+```json
+{"schema_version": 1, "pack": "mine", "batch_id": "batch-1716491400-abc123", "mutations_applied": 3, "results": [{...}, {...}, {...}]}
+```
+
+**Stats JSON (per-source + aggregate + dead-prefix hints):**
+```json
+{"schema_version": 1, "pack_identity": "mine@1.0.0+abc12345", "aggregate": {"total_pages": 4823, "typed_pages": 4710, "untyped_pages": 113, "coverage": 0.9766, "by_type": [{"type": "person", "count": 2104}, ...]}, "per_source": [...], "dead_prefixes": [{"type": "researcher", "prefix": "people/researchers/"}]}
+```
+
+**Sync dry-run JSON:**
+```json
+{"schema_version": 1, "apply": false, "pack_identity": "mine@1.0.0+abc12345", "per_prefix": [{"type": "meeting", "prefix": "meetings/", "would_apply": 4000, "sample_slugs": ["meetings/2026-01-01-foo", ...], "dead_prefix": false, "applied": 0}], "total_would_apply": 4000, "total_applied": 0}
+```
+
+**Human output (the agent's final summary):**
+- One line per mutation: `Pack: <name> (<format>)` and `Sha8: <prev> → <new>`
+- Stats: total pages, typed %, untyped count, per-type breakdown, dead-prefix list
+- Sync: per-prefix `would_apply`/`applied` count + sample slugs in dry-run mode
+
+On failure, the error envelope follows the standard `StructuredAgentError` shape from `src/core/errors.ts`: `{error, code, message, details?}`. Codes from the mutation primitives: `PACK_NOT_FOUND`, `PACK_READONLY`, `PACK_CORRUPT`, `TYPE_EXISTS`, `TYPE_NOT_FOUND`, `INVALID_PRIMITIVE`, `INVALID_RESULT`, `IO_ERROR`, `STILL_REFERENCED`, `LOCK_BUSY`.
+
 ## Failure modes
 
 - `PACK_READONLY` → you tried to mutate `gbrain-base` or `gbrain-recommended`. Fork first.

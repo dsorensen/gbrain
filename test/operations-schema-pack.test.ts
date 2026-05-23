@@ -322,7 +322,7 @@ describe('schema_apply_mutations', () => {
     await withEnv({ GBRAIN_HOME: tmpDir, GBRAIN_AUDIT_DIR: auditDir }, async () => {
       seedPack('mine');
       await operationsByName.schema_apply_mutations!.handler(
-        ctxOf({ clientId: 'wintermuteClient12345678' }),
+        ctxOf({ clientId: 'remoteAgentClient12345678' }),
         {
           pack: 'mine',
           mutations: [{ op: 'add_type', name: 'researcher', primitive: 'entity', prefix: 'r/' }],
@@ -335,8 +335,8 @@ describe('schema_apply_mutations', () => {
       const auditPath = join(auditDir, auditFiles[0]!);
       const lines = readFileSync(auditPath, 'utf-8').trim().split('\n');
       const records = lines.map((l) => JSON.parse(l));
-      // Actor is mcp:<first 8 chars of clientId> = mcp:wintermu (8 chars).
-      expect(records.some((r) => r.actor === 'mcp:wintermu')).toBe(true);
+      // Actor is mcp:<first 8 chars of clientId> = mcp:remoteAg (8 chars).
+      expect(records.some((r) => r.actor === 'mcp:remoteAg')).toBe(true);
     });
   });
 });

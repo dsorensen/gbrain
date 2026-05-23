@@ -3813,7 +3813,7 @@ async function getRemoteMaxBytes(engine: BrainEngine): Promise<number> {
 //
 // Read ops (scope: read; NOT localOnly) — any read-scope OAuth client.
 // Write ops (scope: admin; NOT localOnly per D2) — admin-scope client
-// (Wintermute and similar remote agents) can author schema packs
+// (your OpenClaw and similar remote agents) can author schema packs
 // remotely. Audit log captures actor=mcp:<clientId8> on every mutation
 // (see src/core/schema-pack/mutate-audit.ts privacy posture per D20).
 //
@@ -4012,7 +4012,7 @@ const schema_review_orphans: Operation = {
 
 const schema_apply_mutations: Operation = {
   name: 'schema_apply_mutations',
-  description: 'v0.40.6.0: batched schema pack mutation. ATOMIC: all mutations succeed or all roll back. Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (Wintermute, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
+  description: 'v0.40.7.0: batched schema pack mutation. ATOMIC: all mutations succeed or all roll back. Audit log records one batch_id. Admin scope; NOT localOnly so remote agents (your OpenClaw, etc.) can author packs over normal MCP. Mutation shape per ApplyMutationsRequest type — supports add_type / remove_type / update_type / add_alias / remove_alias / add_prefix / remove_prefix / add_link_type / remove_link_type / set_extractable / set_expert_routing.',
   params: {
     pack: { type: 'string', required: true, description: 'Pack to mutate (must not be bundled)' },
     mutations: {
@@ -4222,7 +4222,7 @@ export const operations: Operation[] = [
   // v0.34 W3b: code_traversal_cache admin clear op
   code_traversal_cache_clear,
   // v0.40.6.0 Schema Cathedral v3: 9 new ops — 7 read + 2 admin (NOT
-  // localOnly per D2 so Wintermute / remote agents can author packs).
+  // localOnly per D2 so remote agents (your OpenClaw, etc.) can author packs).
   // schema_apply_mutations is batched per D10 — one MCP tool, N
   // mutations applied atomically inside one withPackLock scope.
   get_active_schema_pack, list_schema_packs,
