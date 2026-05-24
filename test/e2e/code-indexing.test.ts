@@ -449,4 +449,88 @@ CREATE VIEW active_users_dashboard_summary_view_long_enough_to_split AS
     expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0]!.symbol_type).toBe('view');
   });
+
+  test('findCodeRefs returns SQL chunks by substring match (DML + DDL)', async () => {
+    // code-refs uses chunk_text ILIKE, no DEF_TYPES gate, so it returns
+    // every occurrence (DML + DDL). Distinct from code-def which only
+    // returns definition sites.
+    const refs = await findCodeRefs(engine, 'users_account_table_long_enough_to_avoid_merger', { language: 'sql' });
+    expect(refs.length).toBeGreaterThanOrEqual(1);
+    // At least one ref should land on the CREATE TABLE chunk.
+    const tableRef = refs.find(r => r.symbol_type === 'table');
+    expect(tableRef).toBeDefined();
+  });
+
+  test('CREATE TRIGGER + CREATE TYPE chunks land with correct symbol_type', async () => {
+    const sql = `
+CREATE TYPE long_enough_user_role_enum_so_not_merged AS ENUM ('admin', 'member', 'guest', 'service_account', 'auditor');
+
+CREATE TRIGGER users_long_audit_trigger_for_role_changes
+  AFTER UPDATE ON users
+  FOR EACH ROW
+  WHEN (OLD.email IS DISTINCT FROM NEW.email)
+  EXECUTE FUNCTION log_email_change_long_function_name();
+`;
+    await importCodeFile(engine, 'migrations/002_audit.sql', sql, { noEmbed: true });
+    const typeRows = await engine.executeRaw<{ symbol_type: string }>(
+      `SELECT symbol_type FROM content_chunks
+       WHERE page_id = (SELECT id FROM pages WHERE slug = $1)
+         AND symbol_name = $2`,
+      ['migrations-002_audit-sql', 'long_enough_user_role_enum_so_not_merged'],
+    );
+    expect(typeRows.length).toBeGreaterThanOrEqual(1);
+    expect(typeRows[0]!.symbol_type).toBe('type');
+    const triggerRows = await engine.executeRaw<{ symbol_type: string }>(
+      `SELECT symbol_type FROM content_chunks
+       WHERE page_id = (SELECT id FROM pages WHERE slug = $1)
+         AND symbol_name = $2`,
+      ['migrations-002_audit-sql', 'users_long_audit_trigger_for_role_changes'],
+    );
+    expect(triggerRows.length).toBeGreaterThanOrEqual(1);
+    expect(triggerRows[0]!.symbol_type).toBe('trigger');
+  });
+
+  test('findCodeDef on CREATE TYPE returns it (DEF_TYPES allowlist regression)', async () => {
+    const results = await findCodeDef(engine, 'long_enough_user_role_enum_so_not_merged', { language: 'sql' });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0]!.symbol_type).toBe('type');
+  });
+
+  test('findCodeDef on CREATE TRIGGER returns it (DEF_TYPES allowlist regression)', async () => {
+    const results = await findCodeDef(engine, 'users_long_audit_trigger_for_role_changes', { language: 'sql' });
+    expect(results.length).toBeGreaterThanOrEqual(1);
+    expect(results[0]!.symbol_type).toBe('trigger');
+  });
+
+  test('DML-only file still produces a code page (just no symbol-named chunks)', async () => {
+    const dmlOnly = `
+SELECT u.id, u.email FROM users u WHERE u.deleted_at IS NULL ORDER BY u.created_at;
+INSERT INTO audit_log (event_type, user_id, payload) VALUES ('login', 42, '{"ip":"1.2.3.4"}'::jsonb);
+UPDATE users SET last_login_at = NOW() WHERE id = 42 AND deleted_at IS NULL;
+`;
+    await importCodeFile(engine, 'queries/lib.sql', dmlOnly, { noEmbed: true });
+    const pageRow = await engine.executeRaw<{ type: string; page_kind: string }>(
+      `SELECT type, page_kind FROM pages WHERE slug = 'queries-lib-sql'`,
+    );
+    expect(pageRow.length).toBe(1);
+    expect(pageRow[0]!.type).toBe('code');
+    const namedChunks = await engine.executeRaw<{ symbol_name: string }>(
+      `SELECT symbol_name FROM content_chunks
+       WHERE page_id = (SELECT id FROM pages WHERE slug = 'queries-lib-sql')
+         AND symbol_name IS NOT NULL`,
+    );
+    // Zero named chunks because all statements are DML.
+    expect(namedChunks.length).toBe(0);
+  });
+
+  test('Re-importing same SQL file is idempotent (content_hash short-circuit)', async () => {
+    const sql = 'CREATE TABLE idempotent_test_table_long_name_for_no_merge (id INT, name TEXT, value TEXT, created TIMESTAMP);';
+    await importCodeFile(engine, 'migrations/003_idem.sql', sql, { noEmbed: true });
+    const before = await findCodeDef(engine, 'idempotent_test_table_long_name_for_no_merge', { language: 'sql' });
+    const count1 = before.length;
+    // Re-import: content_hash unchanged → should not duplicate chunks.
+    await importCodeFile(engine, 'migrations/003_idem.sql', sql, { noEmbed: true });
+    const after = await findCodeDef(engine, 'idempotent_test_table_long_name_for_no_merge', { language: 'sql' });
+    expect(after.length).toBe(count1);
+  });
 });

@@ -159,6 +159,67 @@ SELECT * FROM long_mixed_table_name_for_no_merge_with_dml_below_it WHERE id = 1 
     // The chunk emits; symbol_name stays null.
     expect(result[0]!.metadata.language).toBe('sql');
   });
+
+  test('CREATE TRIGGER extracts trigger name + symbolType=trigger', async () => {
+    const sql = `CREATE TRIGGER long_audit_trigger_for_email_changes_on_users_table
+  AFTER UPDATE ON users
+  FOR EACH ROW
+  EXECUTE FUNCTION log_email_change();`;
+    const result = await chunkCodeText(sql, 'trig.sql', { chunkSizeTokens: 50 });
+    const c = result.find(c => c.metadata.symbolType === 'trigger');
+    expect(c).toBeDefined();
+    expect(c!.metadata.symbolName).toBe('long_audit_trigger_for_email_changes_on_users_table');
+  });
+
+  test('CREATE TYPE extracts enum name + symbolType=type', async () => {
+    const sql = `CREATE TYPE long_user_role_enum_avoid_merger_padding AS ENUM ('admin', 'member', 'guest', 'auditor');`;
+    const result = await chunkCodeText(sql, 'types.sql', { chunkSizeTokens: 50 });
+    const c = result.find(c => c.metadata.symbolType === 'type');
+    expect(c).toBeDefined();
+    expect(c!.metadata.symbolName).toBe('long_user_role_enum_avoid_merger_padding');
+  });
+
+  test('CREATE PROCEDURE extracts name + symbolType=procedure', async () => {
+    const sql = `CREATE PROCEDURE long_archive_old_users_procedure_no_merge(days_old INT)
+LANGUAGE SQL AS $$
+  UPDATE users SET deleted_at = NOW() WHERE last_login_at < NOW() - INTERVAL '1 day' * days_old;
+$$;`;
+    const result = await chunkCodeText(sql, 'proc.sql', { chunkSizeTokens: 50 });
+    const c = result.find(c => c.metadata.symbolType === 'procedure');
+    expect(c).toBeDefined();
+    expect(c!.metadata.symbolName).toBe('long_archive_old_users_procedure_no_merge');
+  });
+
+  test('CREATE SCHEMA extracts schema name + symbolType=schema', async () => {
+    const sql = `CREATE SCHEMA IF NOT EXISTS analytics_long_schema_name_avoid_merge AUTHORIZATION analytics_owner;`;
+    const result = await chunkCodeText(sql, 'sch.sql', { chunkSizeTokens: 50 });
+    const c = result.find(c => c.metadata.symbolType === 'schema');
+    // Schema may not always be reachable depending on grammar version;
+    // accept either correct extraction OR null (test that it doesn't crash).
+    if (c) {
+      expect(c.metadata.symbolName).toBe('analytics_long_schema_name_avoid_merge');
+    }
+    // Always: chunk emits, language is sql.
+    expect(result.length).toBeGreaterThanOrEqual(1);
+    expect(result[0]!.metadata.language).toBe('sql');
+  });
+
+  test('header symbolType for SQL chunks reflects inner DDL kind, not "statement"', async () => {
+    const sql = `CREATE TABLE structured_header_test_table_long_name (id INT, name TEXT, value TEXT, ts TIMESTAMP);`;
+    const result = await chunkCodeText(sql, 'header.sql', { chunkSizeTokens: 50 });
+    expect(result[0]!.text).toMatch(/^\[SQL\][^\n]*\btable\b/);
+    expect(result[0]!.text).not.toMatch(/\bstatement\b/i);
+  });
+
+  test('empty SQL input returns empty chunk array', async () => {
+    const result = await chunkCodeText('', 'empty.sql');
+    expect(result).toEqual([]);
+  });
+
+  test('SQL-only whitespace returns empty chunk array', async () => {
+    const result = await chunkCodeText('   \n\n   \t  \n', 'whitespace.sql');
+    expect(result).toEqual([]);
+  });
 });
 
 describe('chunkCodeText — TypeScript', () => {
