@@ -171,7 +171,15 @@ describe('resetTables: schema-migration robustness', () => {
 // ---------------------------------------------------------------------------
 
 describe('warm-create speed gate', () => {
-  test('p50 < 1500ms under parallel test load (catches order-of-magnitude regressions)', async () => {
+  // v0.40.10 flake-hardening: mode-aware ceiling. Solo run on Apple Silicon
+  // shows p50 ~25ms; under 8-way shard CPU contention p50 reaches 600-1200ms;
+  // GitHub Actions Ubuntu runners are slower yet (CI run #77585655194 hit
+  // 17364ms total / ~1736ms/trial). Detect "loaded execution" via `$SHARD`
+  // (set by scripts/run-unit-parallel.sh) OR `$CI` (set by every major CI).
+  // Loaded ceiling 4000ms still catches >50x algorithmic regressions.
+  const LOADED = !!process.env.SHARD || !!process.env.CI;
+  const P50_CEILING_MS = LOADED ? 4000 : 1500;
+  test(`p50 < ${P50_CEILING_MS}ms under parallel test load (catches order-of-magnitude regressions)`, async () => {
     const trials = 10;
     const samples: number[] = [];
     for (let i = 0; i < trials; i++) {
@@ -189,16 +197,11 @@ describe('warm-create speed gate', () => {
     const p50 = samples[Math.floor(samples.length * 0.5)];
     const p99 = samples[Math.floor(samples.length * 0.99)];
     process.stderr.write(
-      `[speed] warm reset+import+search p50=${p50.toFixed(1)}ms p99=${p99.toFixed(1)}ms (n=${trials})\n`,
+      `[speed] warm reset+import+search p50=${p50.toFixed(1)}ms p99=${p99.toFixed(1)}ms (n=${trials}, ceiling=${P50_CEILING_MS}ms loaded=${LOADED})\n`,
     );
-    // Threshold bumped from 500ms → 1500ms because the original was tight enough
-    // to flake under parallel test load (8-way shard process + PGLite WASM
-    // contention). Solo run shows p50 ~25ms; under parallel load p50 can reach
-    // 600-1200ms transiently. 1500ms still catches order-of-magnitude
-    // regressions (a 10x slowdown to 250ms baseline would fail at 2.5s).
-    expect(p50).toBeLessThan(1500);
-    if (p99 > 3000) {
-      process.stderr.write(`[speed] WARN: p99 above 3000ms threshold (informational)\n`);
+    expect(p50).toBeLessThan(P50_CEILING_MS);
+    if (p99 > P50_CEILING_MS * 2) {
+      process.stderr.write(`[speed] WARN: p99 above ${P50_CEILING_MS * 2}ms threshold (informational)\n`);
     }
   });
 });

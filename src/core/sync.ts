@@ -85,6 +85,12 @@ const CODE_EXTENSIONS = new Set<string>([
   // recursive chunker (no tree-sitter grammar), which is the correct
   // fallback — same path as toml / yaml without language-specific AST.
   '.tf', '.tfvars', '.hcl',
+  // v0.41 D2 wave (#1173): SQL via tree-sitter-sql. DerekStride grammar
+  // chunks DDL (CREATE TABLE/FUNCTION/VIEW/INDEX) and DML (SELECT/INSERT/
+  // UPDATE/DELETE) as one chunk per statement. DDL chunks carry
+  // symbol_name + symbol_type populated for code-def; DML chunks emit
+  // unnamed so they don't pollute symbol search.
+  '.sql',
 ]);
 
 /**

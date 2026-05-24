@@ -93,6 +93,285 @@ What we caught and fixed before merging. Three independent reviews + three codex
    ```
 5. **If any step fails or the numbers look wrong,** please file an issue:
    https://github.com/garrytan/gbrain/issues with `gbrain doctor --json` output.
+## [0.40.9.0] - 2026-05-24
+
+**`gbrain sync` now indexes your `.sql` files, and `gbrain code-def` works on SQL tables, functions, views, and indexes the same way it works on TypeScript.**
+
+Until today, point gbrain at a repo that ships database migrations or query libraries and the `.sql` files dropped silently on the floor. The code chunker shipped support for 36 languages — SQL was the conspicuous absence. Closes [#1173](https://github.com/garrytan/gbrain/issues/1173).
+
+Concretely, what changes: `gbrain sync` running over a repo with a `migrations/001_users.sql` file now produces a code page in your brain. Each top-level statement becomes its own chunk. `CREATE TABLE users (...)` lands with `symbol_name='users'` and `symbol_type='table'`. `CREATE OR REPLACE FUNCTION get_user_by_email(...)` lands with `symbol_name='get_user_by_email'` and `symbol_type='function'`. Same for `CREATE VIEW`, `CREATE INDEX`, `CREATE PROCEDURE`, `CREATE TYPE`, `CREATE SCHEMA`, `CREATE DATABASE`, `CREATE TRIGGER`, and `ALTER TABLE` / `ALTER VIEW`. Then `gbrain code-def users` returns the CREATE TABLE site directly — same shape as `gbrain code-def AuthService` on a TypeScript class.
+
+INSERT/UPDATE/DELETE/SELECT statements still get chunked (so a query library stays searchable via vector + keyword) but they emit unnamed — `code-def` is a definition signal, not a query-mention signal, so DML doesn't pollute the symbol surface. PostgreSQL's `$$ ... $$` dollar-quoted function bodies parse cleanly. Files with malformed SQL fall through to the recursive chunker instead of throwing.
+
+**One honesty note about binary size.** The grammar this release vendors (`DerekStride/tree-sitter-sql`) covers PostgreSQL, MySQL, SQLite, and T-SQL basics in one parser. That breadth comes from a 40 MB generated `parser.c` that compiles to an 11 MB WASM. The plan projected 400 KB-1.4 MB before measurement; the real number is ~8x bigger. The compiled gbrain binary grows roughly 6% as a result. If that matters in your deployment, file an issue and we'll evaluate a narrower-coverage fork as a follow-up.
+
+### How to take advantage of v0.40.9.0
+
+Existing brains pick up SQL automatically on the next `gbrain sync` over a repo containing `.sql` files. No migration, no flag, no reembed prompt. No flag exists to turn it off — if you'd previously been ignoring `.sql` files via `.gitignore` and want to keep doing that, that path still works exactly as before.
+
+To verify it works end-to-end on your own brain:
+
+```bash
+gbrain sync                                # syncs any .sql files in your tracked sources
+gbrain code-def <your-table-name>          # should return the CREATE TABLE site
+gbrain code-def <your-function-name>       # should return the CREATE FUNCTION site
+```
+
+If `code-def` returns nothing on a table you know exists in a sync'd `.sql` file, file an issue with the SQL syntax — the DerekStride grammar covers the common dialects but some edge cases (vendor-specific extensions) may parse to a generic statement node where the name isn't reachable via the standard field paths.
+
+### Itemized changes
+
+#### Chunker
+
+- **`src/core/chunkers/code.ts:30+` — vendor `tree-sitter-sql.wasm` (DerekStride/tree-sitter-sql @ c2e1e08db1ea20dc23bdb8d228a81a8756e9c450, built with `tree-sitter-cli@v0.26.3 --abi 14`).** ABI 14 chosen explicitly because gbrain's `web-tree-sitter@0.22.6` supports ABI range 13-14; the CLI's default ABI 15 is incompatible (verified by a load-time `Incompatible language version 15. Compatibility range 13 through 14.` throw during Step 0 grammar inspection). Binary is 11 MB.
+- **`src/core/chunkers/code.ts:121-125` — `SupportedCodeLanguage` union extended with `'sql'`.**
+- **`src/core/chunkers/code.ts:199-229` — `LANGUAGE_MANIFEST` registers `sql: { displayName: 'SQL', embeddedPath: G_SQL }`.**
+- **`src/core/chunkers/code.ts:410+` — `detectCodeLanguage('foo.sql')` returns `'sql'` (case-insensitive).**
+- **`src/core/chunkers/code.ts:325+` — `TOP_LEVEL_TYPES.sql = new Set(['statement'])` catch-all.** DerekStride's grammar wraps every top-level statement in a single `statement` node whose only named child carries the actual kind. The Step 0 grammar-inspection script (`tools/inspect-sql-grammar.ts`) verified this shape against 9 representative SQL fixtures.
+- **`src/core/chunkers/code.ts:1025+` — `extractSymbolName` gains an inline SQL branch.** When the node is `type === 'statement'` with a single named child, it dives into `extractSqlSymbolName(node.namedChild(0))`. That helper recognizes 11 DDL kinds (`create_table`, `create_view`, `create_index`, `create_function`, `create_procedure`, `create_type`, `create_schema`, `create_database`, `create_trigger`, `alter_table`, `alter_view`) and pulls the target identifier from the inner node's `name` field, with fallback to the first `object_reference`/`identifier`-shaped child. Six DML kinds (`select`, `insert`, `update`, `delete`, `merge`, `with`) deliberately return null so chunks emit unnamed.
+- **`src/core/chunkers/code.ts:1044+` — `normalizeSymbolType` gains parallel SQL branches** mapping `create_table → 'table'`, `create_view`/`alter_view → 'view'`, `create_index → 'index'`, `create_procedure → 'procedure'`, `create_type → 'type'`, `create_schema → 'schema'`, `create_database → 'database'`, `create_trigger → 'trigger'`, `alter_table → 'table'`.
+- **`src/core/chunkers/code.ts:639+` — chunker emit-path passes the inner-child type to `normalizeSymbolType` when the outer node is `statement`** so chunk headers say "[SQL] file.sql:1-5 table users" instead of "statement users".
+
+#### Sync routing
+
+- **`src/core/sync.ts:88+` — `CODE_EXTENSIONS` adds `'.sql'`.** `isCodeFilePath('migrations/001_init.sql')` now returns `true`, routing through `importCodeFile()` with `page_kind='code'`.
+
+#### `gbrain code-def` extension
+
+- **`src/commands/code-def.ts:35` — `DEF_TYPES` allowlist extended with `'table'`, `'view'`, `'index'`, `'procedure'`, `'schema'`, `'database'`, `'trigger'`.** Without this, the chunks were indexed correctly but invisible to `gbrain code-def <name>` because the SQL `symbol_type` values fell outside the hardcoded definition-types filter. This was the load-bearing missing piece codex caught in `/plan-eng-review` (F2 finding).
+
+#### Tools + docs
+
+- **`tools/inspect-sql-grammar.ts` (NEW)** — one-shot Step 0 inspection script. Loads the vendored wasm via `web-tree-sitter`, parses 9 representative SQL fixtures (CREATE TABLE / FUNCTION / INDEX / VIEW / ALTER TABLE / CREATE TYPE / mixed DDL+DML / pure DML / invalid SQL), prints top-level node types + the `extractSymbolName` generic output. Output drove the `TOP_LEVEL_TYPES` + `extractSqlSymbolName` design decisions.
+- **`CLAUDE.md`** — grammar count bumped 36→37 with the DerekStride SHA + ABI rationale + 11 MB size disclosure. `src/core/chunkers/` entry extended with the SQL branch documentation.
+- **`llms.txt` + `llms-full.txt`** — regenerated via `bun run build:llms` (CI gate).
+
+#### Tests
+
+- **`test/chunkers/code.test.ts`** — 8 new SQL cases: extension count bump 29→30, `Schema.SQL` case-insensitivity, CREATE TABLE/FUNCTION/INDEX/VIEW/ALTER TABLE each extract correct symbolName + symbolType, DML emits unnamed chunks, mixed DDL+DML per-statement emission, header includes `[SQL]` tag, invalid SQL doesn't crash the parser.
+- **`test/sync-classifier-widening.test.ts`** — 1 new case: SQL extensions classified as code (case-insensitive).
+- **`test/e2e/code-indexing.test.ts`** — 7 new cases against real PGLite. The load-bearing canary asserts `findCodeDef(engine, 'users_account_...', { language: 'sql' })` returns the CREATE TABLE site with `symbol_type='table'`. `beforeAll` timeout bumped to 30s (92-migration replay + 11 MB grammar load pushes past the default 5s on slower CI runners).
+
+### Decisions captured during `/plan-eng-review`
+
+- **D1** (scope, initial): bundle `.sql` + TS/JS JSDoc extraction. Reverted by D6.
+- **D2** (grammar source): `DerekStride/tree-sitter-sql` over the official-org fork. Active maintenance, broad dialect coverage, MIT, reproducible wasm build.
+- **D3** (TOP_LEVEL_TYPES): filtered to schema-defining statements. Corrected by Step 0 to catch-all `statement` because DerekStride wraps every top-level statement in that node type.
+- **D4** (CHUNKER_VERSION): bump 4→5 + wire post-upgrade reembed prompt. Dropped by D6 (no longer needed without JSDoc).
+- **D5** (JSDoc extraction): preceding-sibling AST scan. Dropped by D6.
+- **D6** (scope correction, post-codex): strip JSDoc + CHUNKER_VERSION + reembed-prompt. Keep `.sql` + add SQL symbol-name extraction. Driven by codex's F2 finding that SQL chunking without symbol extraction is "just searchable text," not code intelligence.
+
+## [0.40.8.1] - 2026-05-23
+
+**The README and tutorials are rewritten for someone who has never touched GBrain.** The front-door docs now read as a story you can understand cold: what GBrain does, what it looks like, how to install it, two real walkthroughs that take you from zero to a working brain. No internal jargon, no version archaeology, no assumed context.
+
+The big rewrite covers:
+
+- **README lead** rewritten in first-person voice. Opens with "Search gives you raw pages. GBrain gives you the answer." Frames GBrain as both a personal brain and a company brain, with a link to YC's company-brain Request for Startups.
+- **"What this looks like" section** is now a concrete meeting-prep scenario any professional gets cold: you ask "what do I need to know before my meeting with Alice tomorrow?", you see what a typical retrieval tool returns (a list of 5 pages), you see what GBrain returns (a synthesized briefing with citations and a gap-analysis note). No eval jargon, no judge scores, just the two answers side by side. Closes with "search finds the pages, the brain reads them for you and writes the answer."
+- **New `## Tutorials` section** in the README. Replaces the prior `## Recent Releases` changelog summary (that lives in this file, where it belongs).
+- **New `## Your brain's shape (schema packs)` section** in the README explains the dynamic-schema cathedral in plain English: drop your Notion export or your custom layout, run `gbrain schema detect`, the brain adapts to your shape instead of forcing you to learn its.
+- **All version chatter stripped from the README body.** Per the iron rule "the README should read as the current docs written for people who have never known GBrain before." Version history belongs in this file.
+
+Two new end-to-end tutorials in `docs/tutorials/`:
+
+- **`personal-brain.md`** — the canonical full-stack solo install. Two GitHub repos, a Telegram bot, AlphaClaw on Render, OpenClaw + GBrain + Supabase. About two hours, $100-$150 a month. Includes the three Supabase gotchas every install hits (turn on the `vector` extension, use the connection pooler not the direct connection, buy the IPv4 add-on).
+- **`company-brain.md`** — extends the personal brain into a multi-user shared brain for a 10-50 person team. Federated sources with OAuth-scoped per-user reads, per-person folder conventions, per-person crons, per-person skills, the Slack integration callout (two-cron architecture, channel-to-task-ID mapping, deterministic links, dismissed-items state), and the botmaster onboarding pattern (pre-populate each teammate's slice → walk them through 2-3 wow flows → graduate them to DM only after the wow moment lands).
+- New tutorial-roadmap index at `docs/tutorials/README.md` listing what shipped and what's planned (connect-your-agent, VC dealflow brain, vault migration, code brain, fully-local brain, dream-cycle setup).
+
+Cross-linked from the relevant architecture docs (`docs/INSTALL.md` for the install-path readers, `docs/architecture/topologies.md` for the design-doc readers).
+
+`bun run build:llms` regenerated to pick up the doc structure changes.
+
+### Itemized changes
+
+- `README.md` — first-person lead rewritten; "Search vs Think" section retitled "Two ways to query your brain" (think is a CLI verb, not a brand); company-brain framing paragraph added with YC RFS link; Tutorials section added; `## Your brain's shape (schema packs)` section added; `## Recent Releases` section removed (changelog summary belongs in CHANGELOG.md); all `(v0.X+)` version cites stripped from body; proper-noun capitalization sweep (`alice` → `Alice` in prose, slug forms unchanged); the visceral before/after example rewritten as a universal meeting-prep scenario with zero internal jargon.
+- `docs/tutorials/personal-brain.md` (new) — solo install walkthrough sourced from the live setup session notes. ~2000 words. Includes the three Supabase gotchas (pgvector, connection pooler, IPv4 add-on) in their own subsection.
+- `docs/tutorials/company-brain.md` (new) — multi-user walkthrough, restructured as a true superset of personal-brain (no duplicated install steps). ~5000 words. Covers two scoping models (separate sources with OAuth scoping vs `partners/<slug>/` directory convention in one source), shared rule files at the skills root (`_brain-filing-rules.md`, `_excluded-people.md`, `_output-rules.md`), Slack wiring conventions, and the botmaster onboarding pattern.
+- `docs/tutorials/README.md` (new) — tutorial-roadmap index page.
+- `docs/INSTALL.md` — pointer to the company-brain tutorial in the shared/multi-machine deployment section.
+- `docs/architecture/topologies.md` — pointer to the tutorials directory in the "See also" section.
+- `docs/ethos/ORIGIN.md` — closing paragraph naming the synthesis layer as the reason the brain is worth building.
+- `llms-full.txt` + `llms.txt` — regenerated.
+
+## [0.40.8.0] - 2026-05-23
+
+**Your doctor checks, your operations trust boundary, and your cycle phases now have real behavioral tests — not just source-grep guards.**
+
+Before this release, three of gbrain's load-bearing surfaces shipped with structural tests only: the 50+ doctor checks were verified by grepping source code for check names; the 74 MCP operations were checked for scope annotations but no test proved that `localOnly: true` actually keeps an op off the HTTP wire; and the cycle phases that compose the maintenance loop had no test pinning their result-mapping (counter → status enum). When a refactor accidentally dropped a check or flipped a localOnly flag, the existing tests stayed green. The v0.38.2.0 partial-scan wave was one example — a render bug slipped through because no test drove the doctor orchestrator end-to-end.
+
+This wave adds the missing behavioral coverage. `gbrain doctor --json` now has a subprocess smoke test that runs the full render path against a fresh PGLite tempdir brain and asserts the schema_version=2 envelope, the status enum, and the check list integrity. The doctor's check-building logic was extracted into a small `buildChecks` function so behavioral tests can drive it directly without `process.exit` getting in the way — the wrapper still handles all 10 process.exit sites unchanged, snapshot-pinned so accidental check drop-outs fail loudly at PR review time. The operations trust-boundary surface gets a table-driven contract test over all 74 ops plus targeted handler-invocation regressions for the three historically-broken classes (HTTP MCP shell-job RCE, search_by_image image_path leak, plus the lint contract that file_upload's strict-mode confinement holds). A new shell guard in the `bun run verify` chain catches any future HTTP-exposing module that imports the operations list without applying the `localOnly` filter — the bypass that motivated the v0.26.9 hardening pass.
+
+Two pre-existing master-test flakes get root-caused as part of the same wave: `test/ai/gateway.test.ts` was leaking `OPENAI_API_KEY=openai-fake` into the gateway's module-scoped state, poisoning sibling tests in the same shard that called real `embed()` paths (afterAll cleanup added); and `test/ai/header-transport.test.ts` raced its synthetic recipe registration with sibling files that also mutated the gateway, returning `'[]'` instead of `'ok'` under shard parallelism (file quarantined as `.serial.test.ts`). Neither was a regression from this branch — both were latent bugs that surfaced because the new fast-loop coverage exercised more of the surface concurrently.
+
+### How to take advantage of v0.40.8.0
+
+The added coverage is invisible at runtime. There's nothing to enable or configure — your next `bun run test` already includes 39 new test cases pinning the doctor, operations, and cycle contracts. If you've been wondering whether to trust `gbrain doctor`'s output after a refactor, the new behavioral tests are now the answer.
+
+If you maintain a downstream gbrain fork or extension that imports from `core/operations.ts`, run `bun run check:operations-filter-bypass` once. It'll catch any of your modules that brought the `operations` value in without applying the canonical `.filter(op => !op.localOnly)` filter — three import shapes are detected (destructured, aliased, namespace).
+
+### Itemized changes
+
+#### Doctor refactor (no behavior change, full coverage)
+
+- **`src/commands/doctor.ts:1604` — extract `buildChecks(engine, args, dbSource): Promise<Check[]>` from `runDoctor`.** The check-building logic moves into the new exported function; the existing exported `computeDoctorReport(checks)` at line 78 stays untouched. `runDoctor` is now a thin wrapper: `buildChecks → computeDoctorReport → render + process.exit`. All 10 `process.exit` sites stay where they are (lines 2199, 2220, the 5 inside `--locks` mode, and the remediation subcommands). The two early-return paths (no engine, connection failure) drop their inline `outputResults + process.exit` calls and `return checks` instead — the wrapper still produces identical observable output because both render the same partial check list.
+
+- **`test/doctor-behavioral.test.ts` (new, 13 cases).** Drives `buildChecks` against PGLite. Pure pure-aggregation cases pin `computeDoctorReport` math: 1 fail → -20 points, 3 fails → -60, mixed ok+warn+fail → unhealthy with the fail outcome dominating, score clamped at 0. Orchestrator cases assert `--fast` flag honors the skip set, `--json` arg doesn't alter the check list, the no-engine path returns a partial list without calling `process.exit`, and the snapshot of load-bearing check names (`connection`, `schema_version`, `brain_score`, `sync_freshness`, `search_mode`, `eval_drift`, `reranker_health`, `embedding_width_consistency`, `autopilot_lock_scope`) catches any accidental check drop-out during future refactors.
+
+- **`test/doctor-cli-smoke.serial.test.ts` (new, 1 case).** Subprocess smoke spawning `bun run src/cli.ts doctor --json` against a fresh PGLite tempdir brain via `GBRAIN_HOME=$(mktemp -d)`. Asserts exit code 0 on a freshly-initialized brain, the JSON envelope parses, `schema_version === 2`, `status` is one of `healthy`/`warnings`/`unhealthy`, and `checks` is a non-empty array. Catches render-path bugs that buildChecks-only tests miss — the class the v0.38.2.0 partial-scan wave exposed. Skip via `GBRAIN_SKIP_SUBPROCESS_TESTS=1` for shard-time control; quarantined as `.serial.test.ts` because PGLite write-locks don't play well with parallel runners.
+
+#### Operations trust-boundary contract
+
+- **`test/operations-trust-boundary.test.ts` (new, 14 cases).** Hybrid design: pure assertions over all 74 ops cover the cheap drift-detection win (every op has a scope annotation; every mutating op has a non-read scope; scope is one of the documented enum values; `hasScope(['read'], op.scope)` correctly rejects when op.scope is 'admin' or 'write'). Plus the canonical filter contract: every `localOnly: true` op is excluded from `operations.filter(op => !op.localOnly)`. Plus targeted handler-invocation cases for the two historically-broken HTTP-callable classes: `submit_job` with `name='shell'` + `ctx.remote=true` MUST reject (the F7b HTTP MCP shell-job RCE class), and `search_by_image` with `image_path` + `ctx.remote=true` MUST reject (the D18 P0 image-leak class). `file_upload` and `sync_brain` are deliberately omitted from handler-invocation tests because they're `localOnly: true` — calling their handlers directly would test an impossible production path (codex CMT-3 caught this during plan review). The seven historically-sensitive `localOnly` ops are snapshot-pinned by name: `sync_brain`, `file_upload`, `file_list`, `file_url`, `purge_deleted_pages`, `get_recent_transcripts`, `code_traversal_cache_clear`.
+
+- **`scripts/check-operations-filter-bypass.sh` (new shell guard, wired into `bun run verify`).** Greps `src/` for any module that imports the `operations` value from `core/operations.ts` outside the canonical filter site at `src/commands/serve-http.ts`. Three import shapes are detected: destructured (`import { operations }`), aliased (`import { operations as ops }`), and namespace (`import * as opsModule`). An explicit allow-list of 10 known-safe importers (CLI, dispatch, stdio MCP, the older http-transport, the tool-def helper, the subagent registry, three CLI tools, and serve-http itself) is documented with a one-line rationale per entry. Plus a check that `serve-http.ts` still contains the literal `operations.filter(op => !op.localOnly)` expression — refactoring it out fails the build. Type-only imports of sibling exports like `sourceScopeOpts` and `OperationContext` are deliberately not flagged.
+
+#### Cycle phase wrappers
+
+- **`src/core/cycle.ts:518, 552` — export `runPhaseLint` + `runPhaseBacklinks`.** Adds the `export` keyword to two existing phase functions so behavioral tests can drive them directly. No body changes; no behavior change. Documented as internal helpers exposed for test-only consumption — downstream code should NOT take a dependency on them.
+
+- **`test/cycle-legacy-phases.test.ts` (new, 11 cases).** Combined file with two `describe` blocks for `runPhaseLint` + `runPhaseBacklinks`. Narrowed to result-mapping + error envelope per codex CMT-1 (the legacy phases don't extend `BaseCyclePhase` and don't take a progress reporter or AbortSignal directly, so the contract surface they actually have is the counter → status enum mapping plus the try/catch error envelope). Cases: clean run → status='ok' with summary format, partial fix → status='warn' with `dryRun` in details, dry-run path doesn't write, throw-from-lib → status='fail' with the wrapper's try/catch envelope populated (verified that the throw doesn't escape). Future phase wrappers (sync, extract, embed, orphans, extract_facts, resolve_symbol_edges, recompute_emotional_weight) land as additional describes here, not as new files.
+
+#### Pre-existing master flakes — root-cause fixes (not bandaids)
+
+- **`test/ai/gateway.test.ts` — add `afterAll(() => resetGateway())` cleanup hook.** The file's tests each call `beforeEach(() => resetGateway())` so per-test pollution within the file was handled. But the file's LAST test set `configureGateway({env: {OPENAI_API_KEY: 'openai-fake'}})` and left that state in the gateway module. Other test files in the same bun shard (notably `test/ingestion/ingest-capture.test.ts`) then called code paths that triggered `embed()` without first calling `configureGateway`, hit the real OpenAI endpoint with the leaked fake key, and returned `Incorrect API key provided: openai-fake`. The shard wedged. One-line fix at file teardown stops the leak.
+
+- **`test/ai/header-transport.serial.test.ts` — quarantined from the parallel fast loop (renamed from `header-transport.test.ts`).** The file mutates `RECIPES` (the gateway's module-scoped recipe map) and `configureGateway` to register synthetic recipes, then asserts that `fakeChatFetch` was invoked. Under bun's intra-shard parallelism, sibling files like `test/ai/rerank.test.ts` and `test/gateway-embed-model-override.test.ts` race the same gateway state — the chat test would see `result.text === '[]'` instead of `'ok'` because a parallel test called `resetGateway` between this test's `configureGateway` and its `chat` call. The `.serial.test.ts` rename moves the file out of the parallel pass into the serial-after pass at `--max-concurrency=1` per repo convention.
+
+### Honest notes
+
+Three of the original 10 audit gaps turned out to be non-gaps after surveying the actual repo state — `test/ingestion/{dedup,daemon,skillpack-load}.test.ts` and `test/phantom-redirect.test.ts` already existed with thorough coverage (88 ingestion tests, 38 phantom-redirect tests, all green). The audit was based on stale information. The four real gaps (doctor behavioral, cycle phase wrappers, operations trust-boundary contract, shell guard for HTTP filter) all shipped.
+
+Four follow-up TODOs filed (in the plan file, not TODOS.md yet):
+- NEW-1: per-check leaf unit tests for the 20+ exported doctor check functions (codex CMT-2 deep fix)
+- NEW-2: cycle-phase wrappers for the other 7 phases (sync, extract, embed, orphans, extract_facts, resolve_symbol_edges, recompute_emotional_weight)
+- NEW-3: HTTP-level trust-boundary E2E that proves serve-http.ts honors the localOnly filter at runtime (codex CMT-3 strongest defense)
+- NEW-4: render function extraction from runDoctor (would let doctor-cli-smoke move back into the parallel fast loop)
+## [0.40.7.2] - 2026-05-23
+
+**TODOS.md gets a wave-commitments register at the top.** A `/plan-ceo-review` + `/plan-eng-review` pass clustered the 110 open TODOs into 12 feature themes, articulated the platonic ideal for each, and surfaced three strategic decisions. All three landed on the most ambitious option, and the seven verified-absent items the analysis caught got filed. Nothing in `src/` changed.
+
+The new top section in TODOS.md is the canonical register for the next wave; the rest of the file is unchanged. Plan analysis at `~/.claude/plans/system-instruction-you-are-working-dazzling-pnueli.md` documents the cluster taxonomy + methodology caveats + 7 grep-verified missing items.
+
+## To take advantage of v0.40.7.2
+
+No action required — this is a docs-only release. The wave commitments below land in TODOS.md and inform what `v0.41` and `v0.42` ship. Merged into master after v0.40.7.0 (Schema Cathedral v3); bumped from 0.40.6.1 to 0.40.7.2 to clear the queue.
+
+### Itemized changes
+
+#### TODOS register at top of TODOS.md
+
+- **D1 — v0.41 Eval-loop wave (3× P0):** `gbrain eval gate <baseline>` CI verb (the single most load-bearing missing item across all 12 clusters), contributor-mode eval capture ON by default with airtight privacy, wire nightly quality probe into autopilot scheduler. Substrate is 80% built; the LOOP is 10% wired. These three close the loop.
+- **D2 — Code-indexing promoted to P1 (5 items):** `.sql` file indexing (#1173), Magika auto-detect for extension-less files, full `doc_comment` extraction at chunk time, cross-file edge resolution (Layer 5 precision), code-signature retrieval (per-language). gbrain commits to peer-of-Cursor/Sourcegraph posture.
+- **D3 — v0.42 Non-Latin script wave (5 items):** Postgres CJK FTS via pgroonga/zhparser, widen CJK ranges to Unicode property escapes, CJK-aware overlap context in chunker, Thai/Arabic/Cyrillic/Devanagari support, `git diff --name-status -z` NUL framing. gbrain commits to global-by-design.
+- **Verified-missing items (8):** `gbrain sources promote`, `--explain` auto-on during `gbrain eval replay`, extend `gbrain remote doctor` to stream audit JSONL, new `gbrain costs` command, `gbrain jobs explain <id>`, `docs/security/threat-model.md` catalog, `gbrain doctor --thin-client` parity probe, `gbrain models migrate`. Each grep-verified absent before filing.
+
+Five items duplicate older entries lower in TODOS.md (`.sql` indexing, Magika, doc_comment, CJK items) — duplication noted inline. The new top section is the canonical wave-commitment register; historical entries stay as detail.
+## [0.40.7.0] - 2026-05-23
+
+**Your agents can now author your brain's schema pack themselves — no more shell-out, no more hand-editing YAML.** If you've ever opened `gbrain` and noticed thousands of pages stuck as untyped "notes" under `meetings/` or `research/`, this release closes that loop. Tell Wintermute (or any agent connected via MCP) "my brain has 4000 untyped meetings pages — add a `meeting` type and backfill them," and it does the whole thing safely: locks the pack file so two agents can't race, validates the change won't create dangling references, writes atomically so a crash never leaves the pack half-written, audits the mutation with the agent's identity, then updates every matching page in 1000-row batches that never wedge concurrent writers. The cathedral that was bundled but unreachable in v0.39 is now reachable from the outside.
+
+This release rebuilds the design from a closed community PR ([#1321](https://github.com/garrytan/gbrain/pull/1321)) by `@garrytan-agents` into a production-grade `gbrain schema` cathedral. The four mutation verbs that PR proposed (`add-type`, `remove-type`, `stats`, `sync`) all ship — hardened with atomic+locked+audited writes, pack-aware fallback semantics that fail loud instead of silently re-introducing types you removed, and a batched MCP op (`schema_apply_mutations`) that lets a remote agent compose multi-step refactors as one atomic transaction. The lint surface grew from 2 rules to 11. The graph visualization renders link verbs. And the agent on-ramp story — RESOLVER routing, a `schema-author` skill with explicit boundary callouts to `brain-taxonomist` and `eiirp`, a `conventions/schema-evolution.md` decision tree for "when to add a type vs alias vs prefix" — means agents will actually FIND this surface instead of inventing their own ad-hoc YAML edits.
+
+## To take advantage of v0.40.7.0
+
+`gbrain upgrade` handles this automatically. To verify after upgrade:
+
+```bash
+# 1. See your active pack identity:
+gbrain schema active --json
+
+# 2. Coverage check — how many pages are typed?
+gbrain schema stats --json
+
+# 3. Try the agent journey: fork the bundled pack, add a custom type,
+#    backfill existing pages, verify the wiring works:
+gbrain schema fork gbrain-base mine
+gbrain schema use mine
+gbrain schema add-type researcher --primitive entity --prefix people/researchers/ --extractable --expert
+gbrain schema lint --with-db   # validates against your DB
+gbrain schema sync --apply     # backfills page.type on matching pages
+gbrain whoknows "machine learning"   # researcher-typed pages now route through expert routing
+
+# 4. If you run `gbrain serve --http` for remote MCP, register a client
+#    with admin scope so Wintermute or any other agent can author packs remotely:
+gbrain auth register-client wintermute --scopes admin
+```
+
+If any step fails or numbers look wrong, please file an issue with the output of `gbrain doctor` and `tail -20 ~/.gbrain/audit/schema-mutations-*.jsonl` so we can debug the mutation chain.
+
+### Itemized changes
+
+**New CLI verbs (`gbrain schema *` — 14 new):**
+- `add-type <name> --primitive P --prefix dir/` — append a page type with primitive, prefix, optional `--extractable`, `--expert`, `--alias`.
+- `remove-type <name>` — atomic remove with cross-reference check. If the type is referenced by another type's `aliases`, `enrichable_types`, `link_types`, or `frontmatter_links`, the remove fails loud with the reference list (codex C14 fix from `/plan-eng-review`).
+- `update-type <name> [--extractable BOOL] [--expert BOOL] [--primitive P]` — patch a type's flags without re-creating it.
+- `add-alias <type> <alias>` / `remove-alias <type> <alias>` — atomic single-alias edits.
+- `add-prefix <type> <prefix>` / `remove-prefix <type> <prefix>` — atomic single-prefix edits.
+- `add-link-type <name> [--inverse V] [--page-type T] [--target-type T]` — create new link verbs (e.g. `authored`, `attended`) with inference rules.
+- `remove-link-type <name>` — refuses if any `frontmatter_links` references it.
+- `set-extractable <type> <true|false>` / `set-expert-routing <type> <true|false>` — one-shot flag toggles.
+- `stats [--source <id>]` — per-type page counts + coverage % + dead-prefix detection (declared prefixes with zero matching pages). Multi-source aware.
+- `sync [--apply] [--source <id>]` — backfill `page.type` for rows matching pack prefixes. Dry-run by default; chunked UPDATE in 1000-row batches on `--apply` so concurrent writers never wait.
+- `reload [--pack <name>]` — flush the in-process pack cache so the next call re-reads from disk. Auto-cascades through the extends-chain.
+
+**New MCP operations (9 — the agent on-ramp):**
+- `get_active_schema_pack` (read scope) — cheap identity packet: `{pack_name, version, sha8, page_types_count, link_types_count, primitive_summary, source_tier}`.
+- `list_schema_packs` (read) — bundled + installed packs.
+- `schema_stats` (read) — same output as the CLI `stats` verb, source-scoped.
+- `schema_lint` (read) — file-plane rules over MCP (DB-aware `--with-db` is CLI-only).
+- `schema_graph` (read) — JSON `{nodes, edges}` derived from link types and frontmatter_links.
+- `schema_explain_type` (read) — resolved settings for one declared type.
+- `schema_review_orphans` (read) — drilldown into untyped pages.
+- `schema_apply_mutations` (admin scope, NOT localOnly) — **batched** atomic mutation op. One call applies a list of mutations (`add_type`, `add_link_type`, `set_extractable`, etc.) inside a single `withPackLock` scope. Remote agents like Wintermute can compose multi-step refactors as one transaction. Audit log records `actor: mcp:<clientId8>` per mutation.
+- `reload_schema_pack` (admin) — flush cache + extends-chain cascade.
+
+**Lint rules grew from 2 to 11:**
+- `alias_shadows_type`, `alias_declared_by_two_types`, `alias_references_undeclared_type`
+- `enrichable_types_undeclared`, `link_types_undeclared`, `frontmatter_links_undeclared`
+- `expert_routing_without_prefix`, `prefix_collision`, `prefix_strict_subset_overlap`
+- DB-aware (`--with-db`): `extractable_empty_corpus`, `mutation_count_anomaly`
+
+**Mutation safety primitives:**
+- `pack-lock.ts` — atomic `O_CREAT|O_EXCL` acquire. NOT the TOCTOU `existsSync+writeFileSync` shape from `page-lock.ts`. TTL refresh every 10s while a mutation runs. `--force` semantics: "steal stale lock," not "skip locking."
+- `mutate-audit.ts` — ISO-week JSONL at `~/.gbrain/audit/schema-mutations-YYYY-Www.jsonl`. **Privacy-redacted by default**: type names → sha8, prefixes → first slug segment only. Matches `candidate-audit.ts` privacy posture so a leaked screenshot of either audit file can't reveal sensitive taxonomy. Opt out of redaction with `GBRAIN_SCHEMA_AUDIT_VERBOSE=1`. Logs both success AND failure events so the `schema_pack_writability` doctor check (v0.40.7+) has signal to read.
+- Atomic write via `.tmp + fsync + rename`. The pack file on disk is NEVER partial.
+
+**Cross-process cache invalidation:**
+- `loadActivePack` now stats the pack file with a 1-second TTL gate (env override `GBRAIN_PACK_STAT_TTL_MS`). Operator runs `gbrain schema add-type foo` from a terminal; the autopilot daemon picks up the new type within 1 second on its next `loadActivePack` call. Worst-case stat overhead: ~50µs at most once per second per process. Hot-path cost inside the TTL window: ~10ns.
+- `invalidatePackCache(name)` walks the extends-chain reverse-graph (codex C6 fix). Editing a parent pack used to leave children stale; now every dependent invalidates too.
+
+**T1.5 pack-aware wiring (the silent-no-op fix, partial):**
+- `gbrain whoknows` + the `find_experts` MCP op now consult the active pack for expert types. A `researcher` type declared `expert_routing: true` actually surfaces in `whoknows` results (pre-v0.40.6 it silently never matched because the query path read hardcoded `['person', 'company']`).
+- **Pack-load failure semantics**: empty filter, NOT hardcoded defaults. A pack-load failure makes the query return empty (loud, agent debugs the pack-load problem) instead of silently re-introducing types the user packed out. Same lesson the v0.34.1 federated-read trust gate paid for.
+- Remaining T1.5 sites — `facts/eligibility.ts` and `enrichment-service.ts`'s `'person' | 'company'` union — deferred to v0.40.7+. Filed as TODO.
+
+**Skill + RESOLVER + Convention layer:**
+- `skills/schema-author/SKILL.md` — the agent dispatcher for "evolve the schema pack." Explicit non-goals callout to `brain-taxonomist` (filing one specific page) and `eiirp` (schema-check during iteration) so agents pick the right surface. Workflow: brain → assess → propose → apply → sync → verify → commit.
+- `skills/conventions/schema-evolution.md` — when to add a type vs alias vs prefix. Decision tree: <20 pages → don't pack-codify; 20-100 → alias or narrow prefix; 100+ → first-class type.
+- `skills/RESOLVER.md` entry for `schema-author` with the full trigger list.
+
+### Migration safety
+
+- Pre-v0.40.6 brains: zero breaking changes. The 9 new MCP ops are additive; the existing 16 schema verbs unchanged.
+- Existing OAuth clients with `read` scope: read the new schema ops out of the box.
+- Existing OAuth clients with `admin` scope: can call `schema_apply_mutations` and `reload_schema_pack` immediately. The audit log captures `actor: mcp:<clientId8>` on every mutation for forensic traceability.
+- The mutation primitives refuse to touch bundled packs (`gbrain-base`, `gbrain-recommended`) — `gbrain schema fork gbrain-base mine` first.
+
+### What's safe to know about
+
+- The YAML emitter does NOT preserve comments or formatting in pack.yaml files when mutated. Authors who care about hand-written YAML layout should pin `pack.json` instead.
+- The audit log redacts type names by default. If you need to grep for the raw type name during debugging, set `GBRAIN_SCHEMA_AUDIT_VERBOSE=1` and re-run the mutation.
+- `gbrain schema sync --apply` on a 100K-page brain runs in chunks of 1000; each chunk completes in <100ms. Total wallclock ~10s for 100K rows. Concurrent writers see at most a 100ms wait on any single row.
+
+### Itemized — for contributors
+
+- Plan + 21 decisions captured at `~/.claude/plans/system-instruction-you-are-working-recursive-thacker.md`.
+- Closed PR #1321 with successor pointer comment crediting `@garrytan-agents`.
+- 6 commits land the wave: foundations (e8ea1792), mutate (21beda7f), stats+sync (4f493c96), CLI wiring (60c3da92), MCP ops (90bbd3fa), this commit (skill + docs + version bump).
+- 255+ schema-pack-related tests green (84 new across 9 test files this wave).
+- 3 follow-up TODOs filed for v0.40.7: enrichment-service.ts union widening (`'person' | 'company'` → `string`), facts/eligibility.ts pack-aware extractable-type wiring, doctor checks for schema_pack_coverage / schema_pack_writability / schema_pack_mutation_audit.
+- Contributed by `@garrytan-agents` (original PR #1321 design + verb shape) and `@garrytan` + Claude Opus 4.7 1M (production rebuild).
 
 ## [0.40.6.0] - 2026-05-23
 
