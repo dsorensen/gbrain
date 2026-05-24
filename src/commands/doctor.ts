@@ -563,6 +563,9 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
     checks.push({ name: 'queue_health', status: 'ok', message: 'PGLite — no queue to check' });
   }
 
+  // v0.41 Bug 2 / Eng D8 — subagent_health surfaces rate-lease pressure to the operator.
+  checks.push(await checkSubagentHealth(engine));
+
   // v0.31.12 subagent runtime enforcement (Layer 3 of 3 — Codex F13).
   // The subagent loop is Anthropic-only. If models.tier.subagent or
   // models.default is explicitly set to a non-Anthropic provider, warn here
@@ -852,6 +855,77 @@ export async function checkGradeConfidenceDrift(engine: BrainEngine): Promise<Ch
  * isolation (template fallback is fine), but a sustained high rate signals
  * the rubric needs tuning.
  */
+/**
+ * v0.41 Bug 2 / Eng D8 — surfaces rate-lease pressure from
+ * `minion_lease_pressure_log` (populated by the worker's lease-full bypass
+ * path). The operator's primary forensic signal for "is the lease cap too
+ * tight" — without this check, the v0.41 bypass would be invisible (no
+ * dead-letter, but also no operator awareness).
+ *
+ * Thresholds (windowed at 24h):
+ *   0 bounces                                            → ok ("no pressure")
+ *   1-99 bounces                                         → ok ("transient")
+ *   100+ bounces + subagent jobs completed in same window → ok ("healthy backpressure")
+ *   100+ bounces + ZERO completed subagent jobs           → warn (paste-ready cap-raise hint)
+ *   1000+ bounces                                        → fail ("blocking real work")
+ *
+ * Works on both Postgres + PGLite (migration v93 creates the table on both).
+ * Pre-v93 brains (no table) silently skip with an OK message.
+ */
+export async function checkSubagentHealth(engine: BrainEngine): Promise<Check> {
+  try {
+    const bounceRows = await engine.executeRaw<{ count: string }>(
+      `SELECT count(*)::text AS count FROM minion_lease_pressure_log
+        WHERE bounced_at > now() - interval '24 hours'`,
+    );
+    const bounces = parseInt(bounceRows[0]?.count ?? '0', 10);
+    if (bounces === 0) {
+      return {
+        name: 'subagent_health',
+        status: 'ok',
+        message: 'No rate-lease pressure in last 24h',
+      };
+    }
+    if (bounces >= 1000) {
+      return {
+        name: 'subagent_health',
+        status: 'fail',
+        message: `${bounces} lease-pressure bounces in last 24h — this is blocking real work. Raise the cap: \`export GBRAIN_ANTHROPIC_MAX_INFLIGHT=64\` (or \`unlimited\` for Azure / Bedrock / self-hosted upstreams with no provider-side rate limit). After raising, restart \`gbrain jobs work\`.`,
+      };
+    }
+    // 1-999 bounces: cross-check forward progress.
+    const completedRows = await engine.executeRaw<{ count: string }>(
+      `SELECT count(*)::text AS count FROM minion_jobs
+        WHERE finished_at > now() - interval '24 hours'
+          AND status = 'completed'
+          AND name = 'subagent'`,
+    ).catch(() => [{ count: '0' }]);
+    const completed = parseInt(completedRows[0]?.count ?? '0', 10);
+    if (bounces >= 100 && completed === 0) {
+      return {
+        name: 'subagent_health',
+        status: 'warn',
+        message: `${bounces} lease-pressure bounces in last 24h with no completed subagent jobs — cap is too tight. Raise via \`export GBRAIN_ANTHROPIC_MAX_INFLIGHT=64\` (or \`unlimited\` for upstreams with no provider-side cap).`,
+      };
+    }
+    return {
+      name: 'subagent_health',
+      status: 'ok',
+      message: `Lease pressure: ${bounces} bounces in last 24h, ${completed} subagent jobs completed — backpressure is binding but throughput is healthy`,
+    };
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (process.env.GBRAIN_DEBUG === '1') {
+      process.stderr.write(`[doctor] subagent_health skipped: ${msg}\n`);
+    }
+    return {
+      name: 'subagent_health',
+      status: 'ok',
+      message: 'Skipped (minion_lease_pressure_log unavailable — pre-v0.41 brain)',
+    };
+  }
+}
+
 export async function checkVoiceGateHealth(engine: BrainEngine): Promise<Check> {
   try {
     const rows = await engine.executeRaw<{ total: number; failures: number }>(

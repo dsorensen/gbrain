@@ -91,6 +91,97 @@ If any step fails or numbers look wrong, please file an issue with `gbrain docto
 - `gbrain bench diff` + `gbrain bench list` companion verbs.
 
 Plan + 13 CEO-review decisions + 10 eng-review decisions + 2 codex outside-voice rounds (15 + 9 findings, all absorbed) at `~/.claude/plans/system-instruction-you-are-working-rustling-peacock.md`. Strategic frame: the v0.41 wave closes the eval LOOP end-to-end so retrieval regressions on master burn a publicly-visible score in BrainBench-Real (sibling `gbrain-evals` repo).
+## [0.41.0.0] - 2026-05-24
+
+**Your 100-job subagent batch now actually completes.** A real user ran `gbrain jobs work --concurrency 10` against an Azure-hosted Anthropic endpoint, submitted 100 background jobs, and watched every single one dead-letter with `rate lease "anthropic:messages" full (8/8)`. The default cap of 8 starved 2 workers; every starved job got marked as a failure, hit `max_attempts = 3` after 3 lease-full bounces, and dead-lettered. This release turns minions from "a CLI you drive" into "a fleet you supervise" — submit a batch, walk away, come back to completed work.
+
+Four bugs from the field report fixed first. Then the surrounding ergonomics so leaving the room is a real promise, not honor system.
+
+To turn it on: run `gbrain upgrade`. The defaults do the right thing for fresh installs and existing brains. If you're on Azure / Bedrock / self-hosted with no provider rate limit, also run `export GBRAIN_ANTHROPIC_MAX_INFLIGHT=unlimited` so you're not capped by gbrain's safety default.
+
+What you'd see in a concrete example. A 100-job subagent batch on default settings:
+- **Pre-v0.41:** queue accepts → 100 dead-lettered in 30 seconds → operator stares at the carnage
+- **v0.41:** queue accepts → bounces pace against the upstream → 100 completed in ~3-5 min → `gbrain doctor` shows `subagent_health: ok` → audit row per bounce visible for forensics
+
+Things to know about. (1) Cost protection: `gbrain agent run --budget-usd 5 ...` now actually enforces the ceiling via a reservation pattern that holds even under fan-out. Pre-submit projection prints "this batch will take ~30 min and cost ~$2.40 at current cap of 32" with a paste-ready cap-raise hint. (2) Self-healing batches: when a subagent fails with `prompt_too_long`, `tool_schema_mismatch`, or `malformed_json`, the worker auto-submits one retry with the failure context — `tool_crash` / `tool_unavailable` / `tool_permission` deliberately do NOT self-fix (those are real bugs you need to see). (3) Live dashboard: `gbrain jobs watch` now exists — TTY tail of throughput / lease pressure / clustered errors / budget remaining; admin SPA gets a matching Jobs Watch tab. (4) Auto-adaptive lease cap: the worker reads bounce rate + upstream 429s + latency stability and adjusts the cap automatically. Bounces with NO 429s = workers starving = cap goes UP (the correct sign per codex pass-2 #9 — the original draft had this inverted and would have cratered cap during healthy bursts).
+
+What we caught and fixed before merging. Three independent reviews + three codex outside-voice passes converged on the wave. The reviews found five silently-broken designs that would have shipped without them: an inverted controller, a depth-1 budget ceiling, an unbounded audit table, PGLite-broken lock paths, and deleted-owner budget zombies. All five caught and fixed; ironclad regression tests pin each correction. Test surface: ~120 new unit tests across the new modules plus an IRON-RULE regression test on the E5 controller's bounce-sign that would scream if a future "let's simplify the rule" PR ever flipped it back.
+
+### Itemized changes
+
+**The four base bug fixes (field report):**
+
+- **Bug 1 — rate-lease default 8 → 32 + `unlimited` sentinel.** `src/core/minions/handlers/subagent.ts:61` new `resolveLeaseCap()`. Default cap goes from 8 to 32 (matches 10-concurrency batches without starving). Accepts `unlimited` / `none` as explicit POSITIVE_INFINITY sentinel for upstreams with no provider rate limit. Throws on `NaN` / `0` / negative input with paste-ready hint (codex pass-1 #7: silent `=0`-uncapped semantics were dangerous; "0 means disabled" is the universal convention).
+- **Bug 2 — lease-full bypass that doesn't burn `attempts_made`.** Pre-v0.41, lease-full bounces routed through `failJob` which incremented `attempts_made`. After 3 bounces a job hit `max_attempts` and dead-lettered with `rate lease "anthropic:messages" full (8/8)`. Now: new `MinionQueue.releaseLeaseFullJob()` mirrors `failJob` minus the attempt bump; worker catch block detects `RateLeaseUnavailableError` BEFORE the existing `isUnrecoverable` gate; routes through the bypass with 1-3s jittered backoff. The handler comment at `subagent.ts:425` ("treat as renewable error so the worker re-claims") is now actually true.
+- **Bug 3 — strip `provider:` prefix at the Anthropic SDK call site.** `gbrain agent run --model anthropic:claude-sonnet-4-6` used to send the qualified string straight to `client.messages.create` which Anthropic rejects with "model not found." New `stripProviderPrefix()` helper applies at the one SDK call site; `model` stays qualified everywhere else (persistence, recipe lookup, capability gate).
+- **Bug 4 (absorbed into Approach C) — composable system prompt renderer with per-tool `usage_hint`.** Pre-v0.41 the default subagent system prompt was one generic line; if a tool sat in the registry, the model had no idea when to reach for it. The field-report repro: a `shell` tool was registered, the subagent never used it, and instead described file contents in prose. New `src/core/minions/system-prompt.ts` splices a deterministic preamble listing each tool's name + `usage_hint` (description tells the model HOW; hint tells it WHEN). All 13 brain tools annotated. Closing paragraph names `shell` / `bash` explicitly + tells the model brain tools write to the DB, not local files. Deterministic so the Anthropic prompt-cache marker on the system block stays a hit.
+
+**Visibility infrastructure (Approach C base + Eng D3 / D7 / D8 / D10):**
+
+- New migration v93 `minions_v0_41_audit_and_budget`: three audit tables (`minion_lease_pressure_log`, `minion_budget_log`, `minion_self_fix_log`) with `ON DELETE SET NULL` FKs so audit rows survive `gbrain jobs prune`; denormalized columns (queue_name, model, provider, owner_id, event_type, etc.) persisted inline so post-NULL forensic queries still see context. Three new `minion_jobs` columns: `budget_remaining_cents`, `budget_owner_job_id` (FK SET NULL), `budget_root_owner_id` (no FK — Eng D10 immutable historical reference that survives owner deletion so children can disambiguate "never had a budget" from "owner deleted, halt cleanly"). Postgres + PGLite parity.
+- `gbrain doctor` gains `subagent_health` check. Reads 24h of `minion_lease_pressure_log`. 0 bounces → ok; 100+ with no completed subagents → warn with paste-ready cap-raise hint; 1000+ → fail (blocking). Pre-v93 brains silently skip.
+- `gbrain jobs stats` gains a `Lease pressure (1h)` line + `--cluster-errors` flag that groups dead/failed jobs by classifier bucket via the new `src/core/minions/error-classify.ts` (the shared classifier consumed by both `gbrain jobs stats --cluster-errors` and the E6 self-fix gate).
+- New `src/core/minions/lease-pressure-audit.ts` + `src/core/minions/budget-tracker.ts` — best-effort writers + readers for the new audit tables. Stderr-warn on failure; never blocks the bypass path.
+
+**Live dashboard (D2):**
+
+- New `gbrain jobs watch` command (`src/commands/jobs-watch.ts`). Manual ANSI cursor management, 1s refresh, color-coded lease pressure (green/yellow/red by severity), top-5 clustered errors, budget owners panel. Non-TTY mode emits JSON snapshots per tick.
+- New admin SPA `Jobs Watch` tab (`admin/src/pages/JobsWatch.tsx`) consuming the new `/admin/api/jobs/watch` endpoint. Layout matches TTY 1:1.
+- New `GET /admin/api/jobs/watch` endpoint in `src/commands/serve-http.ts` — shares `readSnapshot()` with the TTY command so the two surfaces stay 1:1.
+
+**Cost cathedral (D4 + D5):**
+
+- New `src/core/minions/batch-projection.ts` — pure math for submit-time projection. Cold-start fallback (no history → model-default per-token pricing + 5s mean latency guess + `(no history; estimate is a wide guess)` annotation). Unknown-model handling returns the tagged variant so `--budget-usd` enforcement can refuse to gate against an unavailable cost estimate (matches the cross-modal-eval precedent). ±30% confidence band; threshold-gated TTY prompt (default $5 / 30min) overridable via env.
+- New `src/core/minions/budget-tracker.ts` — D5 enforcement via reservation pattern (codex pass-2 #5 / Eng D7): worker calls `reserveBudget(parentJobId, expectedMaxTurnCostCents)` BEFORE each turn; SQL UPDATE with CAS guarantees no overspend even across N parallel children of one budget owner. `refundBudget()` returns unspent cents. `haltBudgetSubtree()` walks `budget_owner_job_id = X` to flip the entire subtree to dead with reason `budget_exhausted`. Eng D10 NULL-bypass: jobs without an owner skip reservation cleanly; the immutable `budget_root_owner_id` disambiguates "never had budget" from "owner deleted, halt cleanly."
+
+**Self-tuning fleet (E5 — reframed):**
+
+- New `src/core/minions/lease-cap-controller.ts` — adapts the rate-lease cap (NOT worker concurrency; codex pass-1 caught the original framing was solving the wrong bottleneck). **Eng D6 corrected control law (load-bearing fix):** ramp DOWN ONLY when upstream pushes back (429s > 0.5/min OR latency unstable); ramp UP fast when bounces > 1/min AND no upstream pushback (workers starving inside our artificial cap); ramp UP slow on healthy headroom (no bounces + util > 50%); deadband otherwise. Codex pass-2 #9 caught the original draft had this sign inverted — would have cratered cap during the field-report's 100-job burst. IRON-RULE regression test (`test/lease-cap-controller.test.ts`) pins the correct sign so future "let's simplify" PRs can't silently regress.
+- Per-tick election via new `tryWithDbElection(engine, lockId, ttlMinutes, fn)` helper in `src/core/db-lock.ts` — thin convenience over the existing `tryAcquireDbLock` primitive (codex pass-3 #8/#9: extend the existing primitive rather than build a parallel new one). Eng D9 retrofit of existing rate-leases + queue maxWaiting call sites to the same primitive is filed as a v0.42 follow-up since the existing PGLite single-connection mutex preserves correctness by accident.
+- Workers read `lease_cap_current` from config on every acquire (short-TTL cache) so they pick up controller writes within ~5s of a decision.
+- A/B harness `scripts/e5-lease-cap-ab.ts` per D11 — 500-job batch under Anthropic with log-normal prompt distribution, 15-min 429 burst injection, $8 budget per arm, committed receipt fixture at `test/fixtures/e5-lease-cap-ab/`. Dry-run smoke verified; full-run dispatcher is a v0.41.1 follow-up.
+
+**Self-healing batches (E6 — narrowed):**
+
+- New `src/core/minions/self-fix.ts` — classifier-gated auto-resubmit on terminal failures. RECOVERABLE_CLUSTERS narrowed per codex pass-2 #4: only `prompt_too_long`, `tool_schema_mismatch`, `malformed_json` qualify; `tool_crash` / `tool_unavailable` / `tool_permission` route through normal dead-letter so real bugs stay visible. Chain depth cap default 2 (D15); per-job opt-out via `data.no_self_fix: true`; global off-switch via config.
+- `prompt_too_long` reduction (codex pass-1 #11): v0.41 ships truncate-with-leaf-preservation; full semantic reduction (drop tool_result blocks then Haiku-summarize older pairs) is a v0.42 follow-up. Worst-case current behavior — truncate-then-fail — is safe (no infinite loops, depth cap prevents chains).
+- Children inherit budget owner from parent (Eng D7 + D10) but DO NOT copy the remaining cents (codex pass-3 #5 caught the original plan's contradiction; only the owner row holds spendable balance).
+
+**Three review passes + three codex outside-voice passes converged.** The wave got CEO review + eng review + a third "second eng pass" + codex pass-1 (on CEO plan) + codex pass-2 (on eng additions) + codex pass-3 (on post-corrections plan). Each pass caught corrections the previous pass missed. The post-corrections plan ships with 0 unresolved decisions across 20 user-decided AUQs.
+
+### For contributors
+
+- `test/lease-cap-controller.test.ts` includes the field-report-scenario simulation: starving workers (bounces but no upstream pushback) get MORE capacity, not less. Don't simplify this rule without re-reading codex pass-2 #9.
+- `src/core/minions/error-classify.ts` is the single source of truth for the cluster taxonomy. Adding new clusters is an explicit `RECOVERABLE_CLUSTERS` decision (self-fix qualification gate).
+- Audit table denormalization is load-bearing: codex pass-3 #7 caught that without it, post-NULL FK rows are timestamp-only residue. New audit kinds MUST denormalize the context columns at write time.
+- The retrofit of `pg_advisory_xact_lock` call sites in `src/core/minions/rate-leases.ts:80` and `src/core/minions/queue.ts:152` to the new shared primitive is a v0.42 follow-up (the existing PGLite single-connection mutex preserves correctness by accident; the retrofit makes it explicit).
+
+## To take advantage of v0.41.0.0
+
+`gbrain upgrade` should do this automatically. If it didn't, or if `gbrain doctor` warns about a partial migration:
+
+1. **Run the orchestrator manually:**
+   ```bash
+   gbrain apply-migrations --yes
+   ```
+2. **Verify the outcome:**
+   ```bash
+   gbrain doctor          # should show subagent_health check
+   gbrain jobs stats      # should show Lease pressure (1h) line
+   ```
+3. **Tune the rate-lease cap for your upstream:**
+   - Default Anthropic API → leave at 32 (the new default; works for most workloads).
+   - Azure / Bedrock / self-hosted with no provider-side rate limit:
+     ```bash
+     export GBRAIN_ANTHROPIC_MAX_INFLIGHT=unlimited
+     ```
+4. **Try the live dashboard during your next batch:**
+   ```bash
+   gbrain jobs work --concurrency 10 &
+   gbrain jobs watch                    # in another terminal
+   ```
+5. **If any step fails or the numbers look wrong,** please file an issue:
+   https://github.com/garrytan/gbrain/issues with `gbrain doctor --json` output.
 ## [0.40.10.0] - 2026-05-24
 
 **Your brain stops accepting junk pages, and oversize content stops crashing the embedder.** A page from one of your source repos can no longer break embedding, defeat search, or pollute your knowledge graph just because it's a Cloudflare challenge dump or an absurdly large file. The new sanity gate lives at the narrow waist of ingestion, so every path that writes pages — sync, capture, `put_page` MCP, the `/ingest` webhook — picks it up uniformly.

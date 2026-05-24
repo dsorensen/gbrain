@@ -1,5 +1,58 @@
 # TODOS
 
+## v0.41.0.0 follow-ups (v0.41.1+)
+
+- [ ] **v0.41+: per-key rate-lease caps (`openai:responses`, `google:gemini`, etc.).**
+  v0.41 ships a single `anthropic:messages` rate-lease cap. When users run
+  subagents against multiple providers via the gateway path, each provider
+  should have its OWN rate-lease bucket so they don't share capacity. The
+  right time for this is right after `agent.use_gateway_loop=true` becomes
+  the default — before that, you're solving for a configuration no one uses.
+  Priority: P2. Filed via CEO D13. References: `src/core/minions/rate-leases.ts`
+  + `src/core/minions/handlers/subagent.ts:GBRAIN_ANTHROPIC_MAX_INFLIGHT`.
+
+- [ ] **v0.41+: `minion_lease_pressure_log` + budget/self-fix audit retention sweep.**
+  v0.41 migration v93 promoted `ON DELETE SET NULL` on audit FKs so rows
+  survive `gbrain jobs prune`. Codex pass-3 #5 caught the corollary: without
+  retention, audit tables grow unbounded. On a steady-pressure install
+  (heavy daily batches), `minion_lease_pressure_log` is millions of rows by
+  year 2. Add a sweep phase to the autopilot cycle's `purge` phase (the
+  v0.26.5 pattern, sibling to `engine.purgeDeletedPages(72)`):
+  `engine.purgeOldAuditRows({ lease_pressure_max_age_days: 90, budget_log_max_age_days: 365, self_fix_log_max_age_days: 180 })`.
+  Defaults match operator use cases (90 days lease pressure for capacity
+  tuning, 365 days budget for accounting, 180 days self-fix for
+  classifier-tuning); all overridable via config. Priority: P3. Filed via
+  CEO D16. Closes the unbounded-growth concern that codex flagged as
+  load-bearing pass-3 #5.
+
+- [ ] **v0.41.1: full E5 A/B dispatcher (currently scaffolded as dry-run only).**
+  `scripts/e5-lease-cap-ab.ts` ships the spec + harness + receipt fixture
+  shape but the real-run dispatcher (queue submit + worker spin-up + 15-min
+  429 injector + tick loop + cost-tracking) is deferred. v0.41.1 follow-up
+  writes the dispatcher and commits the first real-API receipt as the
+  baseline before flipping `minions.auto_lease_cap` to default ON.
+
+- [ ] **v0.41.1: `tryWithDbElection` retrofit for existing `pg_advisory_xact_lock` call sites.**
+  Codex pass-2 #7 caught that `src/core/minions/rate-leases.ts:80`
+  (`acquireLease`) and `src/core/minions/queue.ts:152` (maxWaiting coalesce)
+  call `pg_advisory_xact_lock` unconditionally. PGLite has no advisory locks
+  (`src/core/pglite-schema.ts:6`); current code passes by accident because
+  PGLite is single-connection. New `tryWithDbElection` primitive in
+  `src/core/db-lock.ts` is engine-dispatched. Retrofit the two existing
+  call sites to use it so PGLite correctness is explicit, not accidental.
+  Two call shapes needed (codex pass-3 #10): one starts a new tx (E5 use
+  case, already shipped); one accepts an existing tx (rate-leases +
+  maxWaiting use cases). Filed via Eng D9.
+
+- [ ] **v0.42: semantic-aware `prompt_too_long` reduction in E6 self-fix.**
+  v0.41 ships truncate-with-leaf-preservation (first 1000 + last 2000 chars).
+  Codex pass-1 #11 specified the right strategy: walk the conversation, drop
+  tool_result blocks first (largest non-task content), summarize older
+  user/asst pairs via Haiku, never delete the leaf user task. Implementation
+  lives in `src/core/minions/self-fix.ts:buildSelfFixPrompt`. Worst-case
+  current behavior (truncate-then-fail) is safe — no infinite loops,
+  depth-cap prevents chains — but full semantic reduction unlocks higher
+  self-fix success rates on legitimately-long prompts.
 ## v0.41 content-sanity follow-ups (filed during ship of `garrytan/lint-page-size-gate`)
 
 Source: CEO + Eng review on the content-sanity defense plan. Both reviews
