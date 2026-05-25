@@ -2,6 +2,38 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.12.0] - 2026-05-25
+
+**`gbrain ze-switch` no longer silently breaks multimodal search on brains that mix text and image embeddings.**
+
+If you had a brain with image content embedded via Voyage multimodal-3 (1024 dims) and you switched the TEXT embedding model from OpenAI (1536 dims) to ZeroEntropy (1280 dims), the ze-switch transition would silently rewrite the `embedding_image` column to 1280 dims too. Voyage then could not write into it. Image search just stopped returning results. No error. No log line. The column was the wrong shape.
+
+The fix carves the multimodal columns (`embedding_image` and `embedding_multimodal`) out of the schema transition entirely. Only the primary text `embedding` column moves to the new dim. The HNSW index on `embedding_image` is rebuilt to keep the search path warm, but the column type is preserved.
+
+The same wave restored the partial `WHERE embedding_image IS NOT NULL` predicate on the recreated index (matches `src/schema.sql:258-260` verbatim, so the HNSW footprint scales with image-chunk count instead of total-chunk count), and tightened the `information_schema` probe to scope by `table_schema = 'public'`.
+
+To take advantage of v0.41.12.0:
+
+```bash
+gbrain upgrade
+```
+
+No manual action needed. If you already ran `gbrain ze-switch` on a brain with image embeddings before this fix landed and your image search has been broken since, restore by re-embedding the image content (`gbrain embed --stale` or rerun your multimodal ingest path).
+
+### Itemized changes
+
+#### Fixed
+- `gbrain ze-switch` preserves `embedding_image` and `embedding_multimodal` column dimensions during schema transition. Pre-fix, both columns were dropped and recreated at the new text-embedding target dim, breaking the multimodal provider's writes. Cherry-picked from community PR #1443 (originally authored by `@garrytan-agents`).
+- `idx_chunks_embedding_image` is recreated with the canonical `WHERE embedding_image IS NOT NULL` partial-index predicate (matches `src/schema.sql:258-260`). Without it, ze-switch silently turned a sparse partial index into a full HNSW index, wasting space proportional to total chunk count on brains with few image chunks.
+- `runSchemaTransition`'s `information_schema.columns` probe now scopes by `table_schema = 'public'` so the EXISTS check can't false-positive against same-named tables in other schemas.
+
+#### Added
+- Three regression tests in `test/retrieval-upgrade-planner.test.ts` pinning the multimodal-column preservation invariant: dim is still `vector(1024)` post-switch on both `embedding_image` and `embedding_multimodal`, the partial WHERE clause survives the index recreation, and the EXISTS guard short-circuits cleanly on fresh brains that lack the column.
+
+### For contributors
+
+PR #1443 was incorporated through the standard fix-wave workflow: the original fork PR from `@garrytan-agents` was cherry-picked into a base-repo branch (fork PRs from non-collaborator accounts do not inherit base-repo CI secrets), eng-reviewed via `/plan-eng-review`, and the partial-WHERE-clause + schema-qualified-probe corrections were bundled into the same ship to keep the change atomic and bisect-friendly. The original PR is closed; attribution is preserved in the commit trailer.
+
 ## [0.41.8.0] - 2026-05-24
 
 **`gbrain search`, `gbrain query`, and `gbrain get` now actually exit when they finish on PGLite.**
