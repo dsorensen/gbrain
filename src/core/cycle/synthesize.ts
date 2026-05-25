@@ -28,7 +28,7 @@
 
 import Anthropic from '@anthropic-ai/sdk';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, isAbsolute, resolve } from 'node:path';
 import type { BrainEngine } from '../engine.ts';
 import type { PhaseResult, PhaseError } from '../cycle.ts';
 import { MinionQueue } from '../minions/queue.ts';
@@ -239,6 +239,23 @@ export async function runPhaseSynthesize(
   opts: SynthesizePhaseOpts,
 ): Promise<PhaseResult> {
   const start = Date.now();
+  // Normalize brainDir to an absolute path BEFORE any reverse-write. Without
+  // this, a relative or empty brainDir flows down to writeReversePages →
+  // `join(brainDir, '${slug}.md')` → relative path → resolves against cwd at
+  // writeFileSync time, spilling synthesize output into whatever directory
+  // the cycle ran from (e.g., `companies/novamind.md` at the repo root).
+  // Surfaced by the warm-narwhal wave when E2E test cleanup found orphan
+  // synthesize pages at repo root from a `runCycle({brainDir: '.'})` call
+  // chain. Throw on empty (silent cwd-resolution is worse than a loud
+  // failure); resolve if relative (`.` / `./brain` / `../sibling` all valid
+  // inputs but must canonicalize before the write).
+  if (!opts.brainDir || opts.brainDir.trim() === '') {
+    return failed(makeError('InternalError', 'BRAINDIR_EMPTY',
+      'opts.brainDir is empty; refusing to run synthesize. Pass an absolute path.'));
+  }
+  if (!isAbsolute(opts.brainDir)) {
+    opts.brainDir = resolve(opts.brainDir);
+  }
   try {
     const config = await loadSynthConfig(engine);
 
