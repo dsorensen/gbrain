@@ -5472,59 +5472,25 @@ async function runLocksCheck(engine: BrainEngine | null, jsonOutput: boolean): P
 // ============================================================
 
 /**
- * Emit ordered Remediation list to drive brain to --target-score.
+ * CLI wrapper around computeRemediationPlan (src/core/remediation/plan.ts).
  *
- * Read-only — never enqueues, never mutates. The agent contract:
- * inspect the plan with --remediation-plan --json before committing
- * to --remediate. The JSON shape is stable; consumers that parse it
- * can rely on it across releases.
+ * v0.42.0.0 (A1, codex finding #2): library extracted so onboard +
+ * MCP run_onboard can compose against a stable shape. This wrapper
+ * stays as the CLI surface only — argv parsing + human render. JSON
+ * mode emits the library's stable envelope verbatim.
+ *
+ * Read-only — never enqueues, never mutates.
  */
 export async function runRemediationPlan(
   engine: BrainEngine,
   args: string[],
 ): Promise<void> {
-  const { computeRecommendations, classifyChecks, maxReachableScore } =
-    await import('../core/brain-score-recommendations.ts');
+  const { computeRemediationPlan } = await import('../core/remediation/index.ts');
 
   const targetScore = parseIntFlag(args, '--target-score') ?? 90;
   const jsonOutput = args.includes('--json');
 
-  // Cheap path (D7) — don't run slow doctor checks for the plan surface.
-  // The recommendation generator works from BrainHealth + context alone.
-  const health = await engine.getHealth();
-  const ctx = await loadRecommendationContext(engine);
-  const recs = computeRecommendations(health, ctx);
-  // Synthetic check list for classification — we don't need full doctor
-  // output, just the check names the recommendations care about.
-  const syntheticChecks = [
-    { name: 'brain_score', status: 'ok' as const },
-    { name: 'sync_freshness', status: 'ok' as const },
-    { name: 'missing_embeddings', status: 'ok' as const },
-    { name: 'dead_links', status: 'ok' as const },
-    { name: 'orphan_pages', status: 'ok' as const },
-  ];
-  const classifications = classifyChecks(syntheticChecks, ctx);
-  const ceiling = maxReachableScore(health, classifications);
-
-  const filteredRecs = recs.filter((r) => r.status === 'remediable');
-  const estTotalSeconds = filteredRecs.reduce((sum, r) => sum + r.est_seconds, 0);
-  const estTotalUsd = filteredRecs.reduce((sum, r) => sum + (r.est_usd_cost ?? 0), 0);
-
-  const blocked = classifications
-    .filter((c) => c.status === 'blocked')
-    .map((c) => ({ check: c.check, reason: c.reason ?? 'prerequisite missing' }));
-
-  const plan = {
-    schema_version: 2,
-    brain_score_current: health.brain_score,
-    brain_score_target: targetScore,
-    max_reachable_score: ceiling,
-    target_unreachable: targetScore > ceiling,
-    plan: filteredRecs.map((r, i) => ({ step: i + 1, ...r })),
-    est_total_seconds: estTotalSeconds,
-    est_total_usd_cost: Number(estTotalUsd.toFixed(2)),
-    blocked,
-  };
+  const plan = await computeRemediationPlan(engine, { targetScore });
 
   if (jsonOutput) {
     console.log(JSON.stringify(plan, null, 2));
@@ -5532,9 +5498,9 @@ export async function runRemediationPlan(
   }
 
   // Human output
-  console.log(`Brain score: ${health.brain_score}/100 → target ${targetScore}`);
+  console.log(`Brain score: ${plan.brain_score_current}/100 → target ${targetScore}`);
   if (plan.target_unreachable) {
-    console.log(`Target unreachable: max with autonomous remediation is ${ceiling}/100.`);
+    console.log(`Target unreachable: max with autonomous remediation is ${plan.max_reachable_score}/100.`);
   }
   if (plan.plan.length === 0) {
     console.log('No remediations needed. Brain is at target.');
@@ -5546,21 +5512,25 @@ export async function runRemediationPlan(
       console.log(`  ${step.step}. [${step.severity}] ${step.job}${protectedMark} — ${step.rationale}${costMark}`);
     }
   }
-  if (blocked.length > 0) {
+  if (plan.blocked.length > 0) {
     console.log(`\nBlocked checks (prereq missing):`);
-    for (const b of blocked) {
+    for (const b of plan.blocked) {
       console.log(`  - ${b.check}: ${b.reason}`);
     }
   }
 }
 
 /**
- * Submit ordered Remediation jobs sequentially per D3, with D5 cascade
- * on failure and D7 scoped recheck between steps.
+ * CLI wrapper around runRemediation (src/core/remediation/run.ts).
+ *
+ * v0.42.0.0 (A1, codex finding #2): orchestrator extracted into the
+ * remediation library. This wrapper stays as the CLI surface only —
+ * argv parsing + interactive TTY confirmation + human/JSON render via
+ * RemediationHooks.
  *
  * Default behavior: submit-and-wait per step. --dry-run skips submission.
  * --max-usd N refuses if est_total_usd_cost > N. --max-jobs N caps the
- * inner loop.
+ * inner loop. --resume [plan_hash] loads checkpoint and continues.
  *
  * PGLite path: synchronous in-process execution (no durable queue).
  */
@@ -5574,7 +5544,8 @@ export async function runRemediate(
   // documented as the cron-safety guard. Either threads through to the
   // pre-flight estimate refusal AND, via withBudgetTracker, the mid-run
   // BudgetExhausted hard-throw.
-  const maxUsd = parseFloatFlag(args, '--max-usd') ?? parseFloatFlag(args, '--max-cost');
+  const maxUsdRaw = parseFloatFlag(args, '--max-usd') ?? parseFloatFlag(args, '--max-cost');
+  const maxUsd = maxUsdRaw === null ? undefined : maxUsdRaw;
   const dryRun = args.includes('--dry-run');
   const skipConfirm = args.includes('--yes');
   const jsonOutput = args.includes('--json');
@@ -5586,327 +5557,117 @@ export async function runRemediate(
   const resumeArg = resumeMode ? args[resumeFlagIdx + 1] : undefined;
   const resumePlanHash = resumeArg && !resumeArg.startsWith('--') ? resumeArg : undefined;
 
-  const { computeRecommendations, classifyChecks, maxReachableScore } =
-    await import('../core/brain-score-recommendations.ts');
-  const {
-    BudgetTracker,
-    BudgetExhausted,
-  } = await import('../core/budget/budget-tracker.ts');
-  const { withBudgetTracker } = await import('../core/ai/gateway.ts');
-  const {
-    computePlanHash,
-    saveRemediationCheckpoint,
-    loadRemediationCheckpoint,
-    listRemediationCheckpoints,
-    clearRemediationCheckpoint,
-  } = await import('../core/remediation-checkpoint.ts');
+  const { runRemediation, computeRemediationPlan } =
+    await import('../core/remediation/index.ts');
 
-  const ctx = await loadRecommendationContext(engine);
-
-  // Pre-flight ceiling check (D13)
-  const initialHealth = await engine.getHealth();
-  const syntheticChecks = [
-    { name: 'brain_score', status: 'ok' as const },
-    { name: 'sync_freshness', status: 'ok' as const },
-    { name: 'missing_embeddings', status: 'ok' as const },
-    { name: 'dead_links', status: 'ok' as const },
-    { name: 'orphan_pages', status: 'ok' as const },
-  ];
-  const classifications = classifyChecks(syntheticChecks, ctx);
-  const ceiling = maxReachableScore(initialHealth, classifications);
-  if (targetScore > ceiling) {
-    console.error(
-      `[remediate] target ${targetScore} unreachable; max autonomous = ${ceiling}/100. ` +
-      `Configure missing prereqs (see --remediation-plan blocked output) or lower --target-score.`,
-    );
-    process.exit(2);
-  }
-
-  // Initial plan
-  let recs = computeRecommendations(initialHealth, ctx).filter((r) => r.status === 'remediable');
-  if (recs.length === 0) {
-    console.log(`Brain at score ${initialHealth.brain_score}/100, target ${targetScore}. Nothing to do.`);
-    return;
-  }
-
-  // A4 amended: compute plan_hash off the active recommendation ids so the
-  // checkpoint binds to THIS plan. Resume only fires for matching plans.
-  const planHash = computePlanHash(recs.map((r) => r.id));
-  let completedFromCheckpoint = new Set<string>();
-  if (resumeMode) {
-    const requested = resumePlanHash;
-    let cp = requested ? loadRemediationCheckpoint(requested) : null;
-    if (!cp && !requested) {
-      // No explicit hash: try newest checkpoint that matches the active plan.
-      const recent = listRemediationCheckpoints();
-      for (const e of recent) {
-        const candidate = loadRemediationCheckpoint(e.plan_hash);
-        if (candidate && candidate.plan_hash === planHash) {
-          cp = candidate;
-          break;
-        }
-      }
-    }
-    if (!cp) {
+  // TTY confirmation gate (stays in CLI; library doesn't render).
+  // Compute the plan once for the confirmation prompt, then hand off
+  // to the library for the actual run. The library re-computes its
+  // own plan internally — we accept the second computation cost for
+  // a cleaner CLI/library separation.
+  if (!skipConfirm && !dryRun && process.stdout.isTTY && !resumeMode) {
+    const plan = await computeRemediationPlan(engine, { targetScore });
+    if (plan.target_unreachable) {
       console.error(
-        `[remediate --resume] no matching checkpoint found ` +
-          `(plan_hash=${planHash}${requested ? `; requested=${requested}` : ''}). ` +
-          `Run without --resume to start fresh.`,
+        `[remediate] target ${targetScore} unreachable; max autonomous = ${plan.max_reachable_score}/100. ` +
+        `Configure missing prereqs (see --remediation-plan blocked output) or lower --target-score.`,
       );
       process.exit(2);
     }
-    if (cp.plan_hash !== planHash) {
+    if (plan.plan.length === 0) {
+      console.log(`Brain at score ${plan.brain_score_current}/100, target ${targetScore}. Nothing to do.`);
+      return;
+    }
+    if (maxUsd !== undefined && plan.est_total_usd_cost > maxUsd) {
       console.error(
-        `[remediate --resume] checkpoint plan_hash=${cp.plan_hash} does not match active plan_hash=${planHash}. ` +
-          `The plan has changed (brain state moved). Run without --resume to start fresh.`,
+        `[remediate] est cost $${plan.est_total_usd_cost.toFixed(2)} exceeds --max-usd $${maxUsd.toFixed(2)}. Aborting.`,
       );
       process.exit(2);
     }
-    completedFromCheckpoint = new Set(cp.completed.map((c) => c.id));
-    console.error(
-      `[remediate --resume] resuming plan_hash=${planHash}: ${completedFromCheckpoint.size} step(s) completed, ` +
-        `${recs.length - completedFromCheckpoint.size} remaining.`,
-    );
-  }
-
-  const estTotalUsd = recs.reduce((sum, r) => sum + (r.est_usd_cost ?? 0), 0);
-  if (maxUsd !== null && estTotalUsd > maxUsd) {
-    console.error(
-      `[remediate] est cost $${estTotalUsd.toFixed(2)} exceeds --max-usd $${maxUsd.toFixed(2)}. Aborting.`,
-    );
-    process.exit(2);
-  }
-
-  if (!skipConfirm && process.stdout.isTTY) {
-    console.log(`About to submit ${recs.length} job(s), est ${Math.round(recs.reduce((s, r) => s + r.est_seconds, 0))}s, est $${estTotalUsd.toFixed(2)}`);
+    console.log(`About to submit ${plan.plan.length} job(s), est ${plan.est_total_seconds}s, est $${plan.est_total_usd_cost.toFixed(2)}`);
     console.log('Pass --yes to proceed (cron-friendly).');
     process.exit(1);
   }
 
-  if (dryRun) {
-    console.log(`[remediate --dry-run] Would submit ${recs.length} jobs:`);
-    for (const r of recs) console.log(`  - ${r.id} (${r.job})`);
-    return;
-  }
-
-  // Sequential submit per D3, with D5 cascade on failure and D7
-  // scoped recheck between steps.
-  const submitted: Array<{ step: number; id: string; job_id: number | null; status: string }> = [];
-  const abortedIds = new Set<string>();
-  const doctorRunId = crypto.randomUUID();
-
-  const isPGLite = engine.kind === 'pglite';
-  if (isPGLite) {
+  if (engine.kind === 'pglite') {
     console.error('[remediate] PGLite engine: running inline (no durable queue).');
   }
 
-  const { MinionQueue } = await import('../core/minions/queue.ts');
-  const { waitForCompletion } = await import('../core/minions/wait-for-completion.ts');
-  const queue = new MinionQueue(engine);
-
-  // A4 amended: install a BudgetTracker scope around the plan-step loop so
-  // any gateway.chat / embed / rerank inside a Minion handler (synthesize,
-  // patterns, consolidate) auto-enforces the cap. On BudgetExhausted, the
-  // onExhausted callback persists the checkpoint BEFORE the throw propagates;
-  // the catch surfaces the actionable --resume hint.
-  const remediateTracker = new BudgetTracker({
-    label: 'doctor.remediate',
-    maxCostUsd: maxUsd ?? undefined,
-  });
-
-  let exhaustionSnapshot: { spent: number; cap: number; reason: string; model_id?: string } | undefined;
-  remediateTracker.onExhausted(() => {
-    // BudgetTracker fires this synchronously from inside reserve()/record()
-    // before the throw bubbles. Persist whatever has been done so far.
-    const cp = {
-      schema_version: 1 as const,
-      plan_hash: planHash,
-      doctor_run_id: doctorRunId,
-      target_score: targetScore,
-      started_at: new Date().toISOString(),
-      completed: submitted
-        .filter((s) => s.status === 'completed')
-        .map((s) => ({ id: s.id, job: '', status: s.status, job_id: s.job_id ?? null })),
-      aborted_at: new Date().toISOString(),
-      abort_reason: 'budget_exhausted' as const,
-      budget_snapshot: exhaustionSnapshot,
-    };
-    saveRemediationCheckpoint(cp);
-  });
-
-  const runLoop = async (): Promise<void> => {
-    let stepCount = 0;
-    while (recs.length > 0 && stepCount < maxJobs) {
-      const step = recs[0];
-      if (!step) break;
-      stepCount++;
-
-      // Resume: skip steps that the checkpoint already marked completed.
-      if (completedFromCheckpoint.has(step.id)) {
-        submitted.push({ step: stepCount, id: step.id, job_id: null, status: 'completed' });
-        recs.shift();
-        continue;
-      }
-
-      // D5: if depends_on intersects aborted, skip + cascade
-      if (step.depends_on && step.depends_on.some((d) => abortedIds.has(d))) {
-        submitted.push({ step: stepCount, id: step.id, job_id: null, status: 'skipped_dep_aborted' });
-        abortedIds.add(step.id);
-        recs.shift();
-        continue;
-      }
-
-      try {
-        const isProtected = !!step.protected;
-        const job = await queue.add(
-          step.job,
-          { ...step.params, doctor_run_id: doctorRunId },
-          {
-            queue: 'default',
-            idempotency_key: step.idempotency_key,
-            max_attempts: 2,
-            maxWaiting: 1,
-          },
-          isProtected ? { allowProtectedSubmit: true } : undefined,
+  const result = await runRemediation(
+    engine,
+    {
+      targetScore,
+      maxJobs,
+      maxUsd,
+      dryRun,
+      resume: resumeMode,
+      resumePlanHash,
+    },
+    {
+      onTargetUnreachable: (target, ceiling) => {
+        console.error(
+          `[remediate] target ${target} unreachable; max autonomous = ${ceiling}/100. ` +
+          `Configure missing prereqs (see --remediation-plan blocked output) or lower --target-score.`,
         );
-        submitted.push({ step: stepCount, id: step.id, job_id: job.id, status: 'submitted' });
-
-        // Wait for terminal state. PGLite is in-process — short poll.
-        const terminal = await waitForCompletion(queue, job.id, {
-          pollMs: isPGLite ? 250 : 1000,
-          timeoutMs: (step.est_seconds + 60) * 1000,
-        });
-        const lastSub = submitted[submitted.length - 1];
-        if (lastSub) lastSub.status = terminal.status;
-
-        if (terminal.status !== 'completed') {
-          abortedIds.add(step.id);
-        }
-      } catch (e) {
-        if (e instanceof BudgetExhausted) {
-          exhaustionSnapshot = {
-            spent: e.spent,
-            cap: e.cap,
-            reason: e.reason,
-            model_id: e.modelId,
-          };
-          throw e;
-        }
-        submitted.push({
-          step: stepCount, id: step.id, job_id: null,
-          status: `error: ${(e as Error).message.slice(0, 100)}`,
-        });
-        abortedIds.add(step.id);
-      }
-
-      recs.shift();
-      // D7: scoped recheck — re-compute plan from fresh health snapshot.
-      // The next plan may drop completed steps and re-introduce failed
-      // steps with bumped retry suffix (D1).
-      if (recs.length === 0 || stepCount >= maxJobs) break;
-      const freshHealth = await engine.getHealth();
-      recs = computeRecommendations(freshHealth, ctx).filter((r) => r.status === 'remediable');
-    }
-  };
-
-  let budgetExhaustedAt: InstanceType<typeof BudgetExhausted> | null = null;
-  try {
-    await withBudgetTracker(remediateTracker, runLoop);
-  } catch (err) {
-    if (err instanceof BudgetExhausted) {
-      budgetExhaustedAt = err;
-      console.error(
-        `\n[remediate] BudgetExhausted (${err.reason}): spent $${err.spent.toFixed(4)} > cap $${err.cap.toFixed(2)}.\n` +
+      },
+      onNothingToDo: (score, target) => {
+        console.log(`Brain at score ${score}/100, target ${target}. Nothing to do.`);
+      },
+      onBudgetRefused: (estCost, cap) => {
+        console.error(
+          `[remediate] est cost $${estCost.toFixed(2)} exceeds --max-usd $${cap.toFixed(2)}. Aborting.`,
+        );
+      },
+      onResumeMissed: (planHash, requested) => {
+        console.error(
+          `[remediate --resume] no matching checkpoint found ` +
+          `(plan_hash=${planHash}${requested ? `; requested=${requested}` : ''}). ` +
+          `Run without --resume to start fresh.`,
+        );
+      },
+      onResumeLoaded: (planHash, completed, remaining) => {
+        console.error(
+          `[remediate --resume] resuming plan_hash=${planHash}: ${completed} step(s) completed, ${remaining} remaining.`,
+        );
+      },
+      onBudgetExhausted: (planHash, snapshot) => {
+        console.error(
+          `\n[remediate] BudgetExhausted (${snapshot.reason}): spent $${snapshot.spent.toFixed(4)} > cap $${snapshot.cap.toFixed(2)}.\n` +
           `Checkpoint saved. Resume with:\n` +
           `  gbrain doctor --remediate --resume ${planHash}\n`,
-      );
-    } else {
-      throw err;
-    }
-  }
+        );
+      },
+    },
+  );
 
-  // Clear checkpoint on a clean run (no budget abort). Failed steps in the
-  // submitted set don't disqualify the cleanup — they re-surface on the
-  // next plan with bumped suffixes.
-  if (!budgetExhaustedAt) {
-    clearRemediationCheckpoint(planHash);
-  }
+  // CLI surfaces — target unreachable / resume missed already emitted via hooks.
+  // Library returns synthetic result with target_unreachable populated; exit 2.
+  if (result.target_unreachable) process.exit(2);
 
-  const finalHealth = await engine.getHealth();
-  const result = {
-    doctor_run_id: doctorRunId,
-    brain_score_initial: initialHealth.brain_score,
-    brain_score_final: finalHealth.brain_score,
-    brain_score_target: targetScore,
-    target_reached: finalHealth.brain_score >= targetScore,
-    submitted,
-    aborted_count: abortedIds.size,
-  };
+  if (dryRun && result.submitted.length > 0) {
+    console.log(`[remediate --dry-run] Would submit ${result.submitted.length} jobs:`);
+    for (const s of result.submitted) console.log(`  - ${s.id}`);
+    return;
+  }
 
   if (jsonOutput) {
     console.log(JSON.stringify(result, null, 2));
-  } else {
-    console.log(`\nBrain score: ${initialHealth.brain_score} → ${finalHealth.brain_score} (target ${targetScore})`);
-    console.log(`Submitted: ${submitted.length} job(s), ${abortedIds.size} aborted/failed`);
+  } else if (result.submitted.length > 0) {
+    console.log(`\nBrain score: ${result.brain_score_initial} → ${result.brain_score_final} (target ${targetScore})`);
+    console.log(`Submitted: ${result.submitted.length} job(s), ${result.aborted_count} aborted/failed`);
   }
 
-  const anyFailed = submitted.some((s) => s.status !== 'completed' && s.status !== 'submitted');
-  if (budgetExhaustedAt || anyFailed) process.exit(1);
-}
-
-/**
- * Build RecommendationContext from engine + config.
- * Pure read; no side effects.
- */
-async function loadRecommendationContext(engine: BrainEngine) {
-  // v0.37 fix wave (Lane E.4 + CDX2-11): read schema-sizing fields from
-  // gateway, not DB. The DB plane is schema-applied metadata; the file
-  // plane is the gateway runtime source. Pre-fix this context produced
-  // stale recommendations on fresh installs whose DB rows hadn't been
-  // populated.
-  //
-  // Also extended the API-key check to recognize the ZE key alongside
-  // OpenAI (was OpenAI-only). After Lane C.3, zeroentropy_api_key lives
-  // in GBrainConfig + propagates to the gateway env dict.
-  const repoPath = await engine.getConfig('sync.repo_path');
-  let embeddingModel: string | undefined;
-  let embeddingDimensions: number | undefined;
-  try {
-    const gw = await import('../core/ai/gateway.ts');
-    embeddingModel = gw.getEmbeddingModel();
-    embeddingDimensions = gw.getEmbeddingDimensions();
-  } catch {
-    // Gateway unconfigured — fall back to DB plane as a best-effort hint
-    // (preserves doctor running before any engine.connect()).
-    const dbModel = await engine.getConfig('embedding_model');
-    const dbDims = await engine.getConfig('embedding_dimensions');
-    embeddingModel = dbModel ?? undefined;
-    embeddingDimensions = dbDims ? Number(dbDims) : undefined;
-  }
-  // v0.40.x: recipe-aware provider check, shared with autopilot.ts via
-  // embeddingProviderConfigured(). Local providers (ollama, llama-server —
-  // empty auth_env.required) need no hosted key; hosted providers check
-  // their OWN required key (so a Voyage brain is judged by VOYAGE_API_KEY,
-  // not by whether an OpenAI/ZE key happens to exist — the pre-fix wart).
-  // fileCfg loads synchronously, so the resolveKey closure is sync.
-  const { loadConfigFileOnly } = await import('../core/config.ts');
-  const fileCfg = loadConfigFileOnly();
-  const { embeddingProviderConfigured, HOSTED_EMBED_KEY_CONFIG } = await import(
-    '../core/brain-score-recommendations.ts'
+  const anyFailed = result.submitted.some(
+    (s) => s.status !== 'completed' && s.status !== 'submitted' && s.status !== 'dry_run',
   );
-  const embeddingConfigured = embeddingProviderConfigured(embeddingModel, (envVar) => {
-    const cfgField = HOSTED_EMBED_KEY_CONFIG[envVar];
-    const fromCfg = cfgField ? (fileCfg as Record<string, unknown> | null)?.[cfgField] : undefined;
-    return !!(process.env[envVar] || fromCfg);
-  });
-  return {
-    repoPath: repoPath ?? undefined,
-    embeddingModel,
-    embeddingDimensions,
-    embeddingProviderConfigured: embeddingConfigured,
-    hasChatApiKey: !!(process.env.ANTHROPIC_API_KEY || fileCfg?.anthropic_api_key),
-  };
+  if (result.budget_exhausted || anyFailed) process.exit(1);
 }
+
+// v0.42.0.0 (A1, codex finding #2): loadRecommendationContext moved to
+// src/core/remediation/context.ts so onboard + MCP run_onboard compose
+// the same context. The CLI surfaces (runRemediationPlan / runRemediate
+// above) now call computeRemediationPlan + runRemediation from the
+// library, which builds the context internally.
 
 function parseIntFlag(args: string[], flag: string): number | null {
   const i = args.indexOf(flag);
