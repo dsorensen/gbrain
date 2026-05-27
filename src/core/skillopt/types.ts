@@ -235,6 +235,13 @@ export interface GateResult {
   /** Mean of per-task medians. */
   selScore: number;
   reason?: 'no_margin' | 'below_baseline' | 'all_judge_errors';
+  /**
+   * Every scored rollout this gate produced, in selSet order (runs per task
+   * flattened). Used by the orchestrator's forward pass to partition into
+   * successes/failures for reflect. Sel-side gates also surface this but the
+   * orchestrator only reads it for the forward path (runsPerTask=1).
+   */
+  scoredRollouts: ScoredRollout[];
 }
 
 // ─── Bootstrap sentinel (D15) ─────────────────────────────────────────────

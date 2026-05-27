@@ -14,7 +14,6 @@
  */
 
 import { chat as gatewayChat } from '../ai/gateway.ts';
-import { parseJudgeJson } from './score.ts';
 import type { EditOp, ScoredRollout } from './types.ts';
 import type { RejectedEntry } from './rejected-buffer.ts';
 
@@ -158,15 +157,21 @@ function truncate(s: string, max: number): string {
   return s.length > max ? s.slice(0, max) + `\n...(truncated, ${s.length - max} more chars)` : s;
 }
 
-function parseEditsResponse(raw: string): EditOp[] {
-  // Reuse the same forgiving JSON parser as the score module (tagged result
-  // shape; the parser pulls the first {...} object from prose if present).
-  const parsed = parseJudgeJson(raw);
-  if (!parsed) return [];
-  // The parser returned a {score, rationale} shape; for reflect we expect
-  // {edits: [...]}. Re-extract directly with a tolerant fallback.
-  const direct = tryExtractEdits(raw);
-  return direct;
+/**
+ * Parse `{edits: [...]}` from optimizer output. Tolerates ```fenced blocks```,
+ * trailing commas, prose-wrapped JSON. Returns [] when no recoverable edits
+ * are found (caller treats as "this reflect call produced no usable edits"
+ * — same effect as the optimizer returning {edits: []}).
+ *
+ * EXPORTED so reflect.test.ts can pin the parser independently of the chat
+ * transport. Pre-v0.42.0.1 this lived behind a `parseJudgeJson` early-return
+ * guard that always failed (judge-JSON checks for a `score` key, not `edits`),
+ * making every optimizer call silently produce zero edits. The bug survived
+ * v0.42.0.0 because no unit test exercised this parser; the orchestrator's
+ * `successes/failures: []` hardcoding masked it end-to-end too.
+ */
+export function parseEditsResponse(raw: string): EditOp[] {
+  return tryExtractEdits(raw);
 }
 
 function tryExtractEdits(raw: string): EditOp[] {

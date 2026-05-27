@@ -34,6 +34,13 @@ export interface ValidateGateOpts extends Omit<GateInput, 'selSet'> {
   judgeModel?: string;
   /** D4: max in-flight sel-task evaluations. Default 4. */
   concurrency?: number;
+  /**
+   * Runs per task for the median-of-N. Default `VALIDATION_RUNS_PER_TASK` (3)
+   * for sel-side acceptance gates. The orchestrator's forward pass passes 1
+   * because we only need a rough partition into successes/failures, not noise
+   * rejection. Must be >= 1.
+   */
+  runsPerTask?: number;
   abortSignal?: AbortSignal;
   /** Test seam — substitute rollout. */
   rolloutFn?: typeof runRollout;
@@ -49,14 +56,25 @@ export async function runValidationGate(opts: ValidateGateOpts): Promise<GateRes
   const rolloutFn = opts.rolloutFn ?? runRollout;
   const scoreFn = opts.scoreFn ?? scoreTrajectory;
   const concurrency = opts.concurrency ?? 4;
+  // Forward pass uses 1; sel/baseline use VALIDATION_RUNS_PER_TASK (3). Floor
+  // at 1 (a runsPerTask of 0 would silently produce an empty median).
+  const runsPerTask = Math.max(1, opts.runsPerTask ?? VALIDATION_RUNS_PER_TASK);
+
+  interface PerTask {
+    task_id: string;
+    median: number;
+    runs: number[];
+    rollouts: ScoredRollout[];
+  }
 
   // Per sel-task, run N rollouts + N judges, take median.
   const settled = await runWithLimit({
     items: opts.selSet,
     limit: concurrency,
-    fn: async (task: BenchmarkTask): Promise<{ task_id: string; median: number; runs: number[] }> => {
+    fn: async (task: BenchmarkTask): Promise<PerTask> => {
       const runs: number[] = [];
-      for (let i = 0; i < VALIDATION_RUNS_PER_TASK; i++) {
+      const rollouts: ScoredRollout[] = [];
+      for (let i = 0; i < runsPerTask; i++) {
         const rolloutOpts: RolloutOpts = {
           engine: opts.engine,
           skillText: opts.candidateSkillText,
@@ -69,18 +87,22 @@ export async function runValidationGate(opts: ValidateGateOpts): Promise<GateRes
           judgeModel: opts.judgeModel,
         });
         runs.push(scored.score);
+        rollouts.push(scored);
       }
-      return { task_id: task.task_id, median: median(runs), runs };
+      return { task_id: task.task_id, median: median(runs), runs, rollouts };
     },
     signal: opts.abortSignal,
   });
 
   // SettledItem<TOut>[] — extract successful results; treat errors as score=0
   // (pessimistic fallback consistent with the judge fail-open posture).
+  // Errored tasks contribute no scoredRollouts (caller's reflect sees fewer
+  // trajectories rather than fabricated zero-score entries).
   const perTaskMedians = settled.map((s, idx) => {
-    if (s && s.ok) return s.value;
+    if (s && s.ok) return { task_id: s.value.task_id, median: s.value.median, runs: s.value.runs };
     return { task_id: opts.selSet[idx]!.task_id, median: 0, runs: [] };
   });
+  const scoredRollouts: ScoredRollout[] = settled.flatMap((s) => (s && s.ok) ? s.value.rollouts : []);
   const selScore = perTaskMedians.length === 0
     ? 0
     : perTaskMedians.reduce((acc, r) => acc + r.median, 0) / perTaskMedians.length;
@@ -95,7 +117,7 @@ export async function runValidationGate(opts: ValidateGateOpts): Promise<GateRes
     if (selScore <= opts.bestScore) reason = 'below_baseline';
     else reason = 'no_margin';
   }
-  return { accepted, perTaskMedians, selScore, ...(reason ? { reason } : {}) };
+  return { accepted, perTaskMedians, selScore, scoredRollouts, ...(reason ? { reason } : {}) };
 }
 
 /** Pure median for an array of numbers. Returns 0 for empty array. */

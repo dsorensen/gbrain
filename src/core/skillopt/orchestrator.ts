@@ -315,10 +315,9 @@ async function runOptimizationLoop(
           const batch = split.train.slice(batchStart, batchStart + opts.batchSize);
 
           // FORWARD PASS: run rollouts on each batch task using current best.
-          // We use the validation-gate primitive for a quick rough score —
-          // for the train batch we only need 1 run per task, not median-of-3.
-          // For brevity in v1, reuse the gate function with batch as selSet;
-          // a follow-up TODO is to add a single-run rollout helper.
+          // runsPerTask=1 — for the train batch we only need a rough partition
+          // into successes/failures, not the median-of-3 noise rejection the
+          // sel-side gate uses. ScoredRollouts come back via GateResult.
           const forwardGate = await runValidationGate({
             engine: opts.engine,
             candidateSkillText: checkpoint!.best_skill_text,
@@ -326,21 +325,20 @@ async function runOptimizationLoop(
             bestScore: -1,
             targetModel: opts.targetModel,
             judgeModel: opts.judgeModel,
+            runsPerTask: 1,
           });
-          // Partition into successes vs failures (>= 0.5 threshold).
-          // We don't have access to the raw trajectories from gate, so reflect
-          // operates on summaries. Future: surface trajectories through gate.
-          const successesCount = forwardGate.perTaskMedians.filter((t) => t.median >= 0.5).length;
-          const failuresCount = forwardGate.perTaskMedians.length - successesCount;
-          void failuresCount;
-          void successesCount;
+          // Partition into successes vs failures (>= 0.5 threshold). Reflect
+          // gets the actual scored trajectories so failure-mode + success-mode
+          // analysis can ground in real agent behavior (D7).
+          const successes = forwardGate.scoredRollouts.filter((r) => r.score >= 0.5);
+          const failures = forwardGate.scoredRollouts.filter((r) => r.score < 0.5);
 
           // BACKWARD PASS: D7 two reflect calls (failures + successes).
           const rejected = loadRejectedBuffer(skillsDir, skillName);
           const reflectResult = await runReflect({
             skillBodyText: checkpoint!.best_skill_text,
-            successes: [], // simplified for v1: see TODO above
-            failures: [],
+            successes,
+            failures,
             rejected,
             optimizerModel: opts.optimizerModel,
             abortSignal: undefined,
