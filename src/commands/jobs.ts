@@ -1563,6 +1563,17 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
     });
   });
 
+  // v0.42.0.0 (A11, T8): extract-timeline-from-meetings handler. Wraps
+  // extractTimelineFromMeetings. NOT in PROTECTED_JOB_NAMES (pure SQL + string
+  // scan, no LLM spend).
+  worker.register('extract-timeline-from-meetings', async (job) => {
+    const { extractTimelineFromMeetings } = await import('../core/extract-timeline-from-meetings.ts');
+    const data = (job.data ?? {}) as { sourceId?: string };
+    return await extractTimelineFromMeetings(engine, {
+      sourceIdFilter: data.sourceId,
+    });
+  });
+
   // v0.42.0.0 (A13): embed-catch-up handler for the gbrain onboard
   // remediation pipeline. Wraps runEmbedCore with stale + catchUp + the
   // priority/batchSize the recommendation supplies. NOT in

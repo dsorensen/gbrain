@@ -449,6 +449,9 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
   // DB-source-only posture as --by-mention. Can combine with --by-mention
   // in a single command for a shared-gazetteer walk (saves one pass).
   const ner = args.includes('--ner');
+  // v0.42.0.0 (A11, T8): --from-meetings extracts timeline entries from
+  // meeting pages onto each discussed entity. Timeline subcommand only.
+  const fromMeetings = args.includes('--from-meetings');
 
   // Validate --since upfront. Without this, an invalid date like
   // `--since yesterday` produces NaN which silently passes the filter check
@@ -512,6 +515,22 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
     );
     process.exit(2);
   }
+  // v0.42.0.0 (T8): --from-meetings is timeline-only + DB-source-only.
+  if (fromMeetings && source === 'fs') {
+    console.error(
+      `--from-meetings requires --source db (currently --source fs). Re-run as:\n\n` +
+      `  gbrain extract timeline --from-meetings --source db` +
+      (sourceIdFilter ? ` --source-id ${sourceIdFilter}` : '') +
+      (dryRun ? ' --dry-run' : '') + '\n',
+    );
+    process.exit(2);
+  }
+  if (fromMeetings && subcommand !== 'timeline' && subcommand !== 'all') {
+    console.error(
+      `--from-meetings is a timeline-pass only. Re-run as 'gbrain extract timeline --from-meetings' or 'gbrain extract all --from-meetings'.`,
+    );
+    process.exit(2);
+  }
 
   // FS source needs a brain dir. When --dir wasn't passed, resolve from
   // sources(local_path) — same path `gbrain sync` uses — instead of
@@ -550,7 +569,17 @@ export async function runExtract(engine: BrainEngine, args: string[]) {
       // 'markdown'/'frontmatter') so they don't conflict, but mixing them
       // in a single CLI invocation is surprising — keep the surfaces
       // separate.
-      if (byMention || ner) {
+      if (fromMeetings) {
+        // v0.42.0.0 (T8): timeline-from-meetings runs SOLO (doesn't combine
+        // with --by-mention/--ner because those are links passes).
+        const { extractTimelineFromMeetings } = await import('../core/extract-timeline-from-meetings.ts');
+        const r = await extractTimelineFromMeetings(engine, { dryRun, sourceIdFilter });
+        result.timeline_entries_created = r.entries_created;
+        result.pages_processed = r.meetings_scanned;
+        if (!jsonMode) {
+          console.log(`Timeline from meetings: ${r.entries_created} entries on ${r.entities_touched} entity pages from ${r.meetings_scanned} meetings`);
+        }
+      } else if (byMention || ner) {
         // v0.42.0.0 (T7): combined --by-mention + --ner walk shares one
         // gazetteer; saves an entire pass on big brains. When only one
         // flag is set, the other extractor skips silently.
