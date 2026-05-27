@@ -661,6 +661,9 @@ export async function doctorReportRemote(engine: BrainEngine): Promise<DoctorRep
   // 6. Sync freshness check
   checks.push(await checkSyncFreshness(engine));
 
+  // v0.41.19.0 (Issue 5): sync --all consolidation nudge for multi-source brains.
+  checks.push(await checkSyncConsolidation(engine));
+
   // v0.39 T7 + T9 — schema-pack health checks (3 checks per v0.38 plan):
   //   schema_pack_active        — active pack resolves cleanly
   //   schema_pack_consistency   — % of pages typed against active pack
@@ -2594,6 +2597,60 @@ export async function checkSyncFreshness(
       name: 'sync_freshness',
       status: 'warn',
       message: `Could not check sync freshness: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
+
+/**
+ * v0.41.19.0 (Issue 5 of ops-fix-wave) — surface `sync --all --parallel`
+ * to operators with multi-source brains.
+ *
+ * Background: `gbrain sync --all --parallel N --workers N --skip-failed`
+ * has existed since v0.40.3.0 but most operators still maintain separate
+ * per-source cron entries with manual deconfliction. One `--all` line
+ * replaces N per-source lines AND auto-picks-up future sources without
+ * a crontab edit.
+ *
+ * Surgical scope: we can't reach into the user's crontab (host-specific,
+ * portability risk). What we CAN do is surface the paste-ready command
+ * inside `gbrain doctor` so the operator sees it whenever they run a
+ * health check on a multi-source brain.
+ *
+ * Posture: never failure-state. Always `ok` with the paste-ready cmd
+ * embedded in the message (matches how sync_freshness embeds fix hints).
+ * Single-source brains get `ok` with a "not applicable" message.
+ * SQL error → `warn` (own try/catch, not relying on the outer doctor
+ * dispatcher — codex flagged this).
+ */
+export async function checkSyncConsolidation(engine: BrainEngine): Promise<Check> {
+  try {
+    const rows = await engine.executeRaw<{ id: string }>(
+      `SELECT id FROM sources
+        WHERE archived IS NOT TRUE
+          AND local_path IS NOT NULL`,
+    );
+    const sourceCount = rows.length;
+    if (sourceCount < 2) {
+      return {
+        name: 'sync_consolidation',
+        status: 'ok',
+        message: 'Single-source brain — sync --all consolidation not applicable.',
+      };
+    }
+    return {
+      name: 'sync_consolidation',
+      status: 'ok',
+      message:
+        `${sourceCount} active sources detected. Recommended cron: ` +
+        '`gbrain sync --all --parallel 4 --workers 4 --skip-failed`. ' +
+        'If your crontab has separate per-source entries, replace them with one --all line — ' +
+        'future sources auto-pick-up without a crontab edit.',
+    };
+  } catch (err) {
+    return {
+      name: 'sync_consolidation',
+      status: 'warn',
+      message: `Could not check sync consolidation: ${err instanceof Error ? err.message : String(err)}`,
     };
   }
 }
@@ -5473,6 +5530,9 @@ export async function buildChecks(
   if (engine !== null) {
     progress.heartbeat('sync_freshness');
     checks.push(await checkSyncFreshness(engine));
+    // v0.41.19.0 (Issue 5): sync --all consolidation nudge.
+    progress.heartbeat('sync_consolidation');
+    checks.push(await checkSyncConsolidation(engine));
     // v0.38 — full-cycle freshness, sibling to sync_freshness. Reads
     // last_full_cycle_at from sources.config; mirrors what autopilot's
     // per-source dispatch gate sees.

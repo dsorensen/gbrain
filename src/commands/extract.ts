@@ -51,6 +51,10 @@ import { withRetry, isRetryableConnError } from '../core/retry.ts';
 export { withRetry };
 export type { WithRetryOpts } from '../core/retry.ts';
 import { buildGazetteer, findMentionedEntities } from '../core/by-mention.ts';
+import {
+  loadOpCheckpoint, recordCompleted, clearOpCheckpoint, mentionsFingerprint,
+} from '../core/op-checkpoint.ts';
+import { createHash } from 'crypto';
 // v0.41.15.0 (T7, D9): --workers N for the fs-walk inner loops via the
 // shared sliding-pool helper + PGLite-clamp wrapper.
 import { runSlidingPool } from '../core/worker-pool.ts';
@@ -1324,18 +1328,51 @@ async function extractMentionsFromDb(
     return { created: 0, pages: 0 };
   }
 
+  // v0.41.19.0 (T5): gazetteer hash is part of the checkpoint
+  // fingerprint so adding new entity pages mid-pause invalidates the
+  // checkpoint cleanly. Without it, resumed pages would skip new
+  // entities silently (codex flag).
+  const gazetteerHash = createHash('sha256')
+    .update([...gazetteer.keys()].sort().join('|'))
+    .digest('hex')
+    .slice(0, 8);
+
   const allRefs = sourceIdFilter
     ? (await engine.listAllPageRefs()).filter(r => r.source_id === sourceIdFilter)
     : await engine.listAllPageRefs();
+
+  // v0.41.19.0 (T5): load checkpoint and skip already-completed
+  // (source_id, slug) pairs. Dry-run does NOT load OR persist the
+  // checkpoint — dry-run is an inspection mode and shouldn't pollute
+  // resume state for the next non-dry-run.
+  const ckptKey = {
+    op: 'extract-by-mention',
+    fingerprint: mentionsFingerprint({
+      source: sourceIdFilter,
+      type: typeFilter,
+      since,
+      gazetteerHash,
+    }),
+  };
+  const completed = dryRun
+    ? new Set<string>()
+    : new Set(await loadOpCheckpoint(engine, ckptKey));
+  const remaining = completed.size > 0
+    ? allRefs.filter(r => !completed.has(`${r.source_id}::${r.slug}`))
+    : allRefs;
+
+  if (completed.size > 0 && !jsonMode) {
+    console.log(`[by-mention] resuming: ${completed.size}/${allRefs.length} pages already scanned, ${remaining.length} remaining`);
+  }
 
   let processed = 0;
   let created = 0;
   const batch: LinkBatchInput[] = [];
 
   const progress = createProgress(cliOptsToProgressOptions(getCliOptions()));
-  progress.start('extract.by_mention.scan', allRefs.length);
+  progress.start('extract.by_mention.scan', remaining.length);
 
-  async function flush() {
+  async function flushBatch() {
     if (batch.length === 0) return;
     try {
       created += await engine.addLinksBatch(batch, { auditSite: 'extract.by_mention' }); // gbrain-allow-direct-insert: gbrain extract --by-mention — canonical auto-link write from body-text mention scan
@@ -1351,15 +1388,54 @@ async function extractMentionsFromDb(
     }
   }
 
+  // v0.41.19.0 (T5 — codex fix #1): flush links FIRST, commit pending
+  // page keys to checkpoint SECOND, persist THIRD. A crash between
+  // batch.push() and flushBatch() leaves pendingForFlush uncommitted —
+  // resume re-scans those pages instead of silently losing their links.
+  //
+  // Persist cadence: every 1000 items OR every 30s, whichever first
+  // (~322 persists on a 322K-page brain, ~24s total overhead). Crash
+  // window is at most 1000 pages (<0.3% loss on the driver brain).
+  const PERSIST_EVERY_N = 1000;
+  const PERSIST_EVERY_MS = 30_000;
+  const pendingForFlush: string[] = [];
+  let sinceLastPersistMs = Date.now();
+  let unpersistedCount = 0;
+
+  async function flushAndCheckpoint(force = false): Promise<void> {
+    await flushBatch();
+    for (const key of pendingForFlush) completed.add(key);
+    pendingForFlush.length = 0;
+    if (dryRun) return;
+    const now = Date.now();
+    if (force || unpersistedCount >= PERSIST_EVERY_N || (now - sinceLastPersistMs) >= PERSIST_EVERY_MS) {
+      await recordCompleted(engine, ckptKey, [...completed]);
+      unpersistedCount = 0;
+      sinceLastPersistMs = now;
+    }
+  }
+
   const sinceMs = since ? new Date(since).getTime() : null;
 
-  for (const { slug, source_id } of allRefs) {
+  for (const { slug, source_id } of remaining) {
     const page = await engine.getPage(slug, { sourceId: source_id });
-    if (!page) continue;
-    if (typeFilter && page.type !== typeFilter) continue;
+    // v0.41.19.0 (T5 — codex fix #4): even when we skip a page (filter
+    // miss, missing row, empty body, no mentions), MARK IT COMPLETED so
+    // resume doesn't re-fetch it. The decision NOT to create links is
+    // itself a completed decision.
+    const key = `${source_id}::${slug}`;
+    if (!page || (typeFilter && page.type !== typeFilter)) {
+      pendingForFlush.push(key);
+      unpersistedCount++;
+      continue;
+    }
     if (sinceMs !== null) {
       const updatedMs = new Date(page.updated_at).getTime();
-      if (Number.isFinite(updatedMs) && updatedMs <= sinceMs) continue;
+      if (Number.isFinite(updatedMs) && updatedMs <= sinceMs) {
+        pendingForFlush.push(key);
+        unpersistedCount++;
+        continue;
+      }
     }
     processed++;
     progress.tick();
@@ -1368,14 +1444,22 @@ async function extractMentionsFromDb(
     // end-of-compiled token doesn't accidentally merge with a
     // start-of-timeline token into a false phrase match.
     const body = page.compiled_truth + '\n\n' + (page.timeline ?? '');
-    if (!body.trim()) continue;
+    if (!body.trim()) {
+      pendingForFlush.push(key);
+      unpersistedCount++;
+      continue;
+    }
 
     const mentions = findMentionedEntities(body, gazetteer, {
       fromSlug: slug,
       fromSourceId: source_id,
     });
 
-    if (mentions.length === 0) continue;
+    if (mentions.length === 0) {
+      pendingForFlush.push(key);
+      unpersistedCount++;
+      continue;
+    }
 
     for (const m of mentions) {
       if (dryRun) {
@@ -1399,13 +1483,31 @@ async function extractMentionsFromDb(
           from_source_id: source_id,
           to_source_id: m.source_id,
         });
-        if (batch.length >= BATCH_SIZE) await flush();
+        if (batch.length >= BATCH_SIZE) {
+          // The page that produced these batch entries stays UN-committed
+          // until flushBatch succeeds. The push below happens AFTER the
+          // flushAndCheckpoint call so a crash inside flushBatch leaves
+          // the page un-checkpointed and resume re-scans it.
+          await flushAndCheckpoint();
+        }
       }
+    }
+    // Page completed (whether dry-run or non-dry-run). Stage for the
+    // next flushAndCheckpoint().
+    pendingForFlush.push(key);
+    unpersistedCount++;
+    // Time-based cadence floor.
+    if (!dryRun && (Date.now() - sinceLastPersistMs) >= PERSIST_EVERY_MS) {
+      await flushAndCheckpoint();
     }
   }
 
-  if (!dryRun) await flush();
+  if (!dryRun) {
+    await flushAndCheckpoint(true); // final flush + force-persist
+  }
   progress.finish();
+
+  if (!dryRun) await clearOpCheckpoint(engine, ckptKey); // clean exit
 
   if (!jsonMode) {
     const label = dryRun ? '(dry run) would create' : 'created';

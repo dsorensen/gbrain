@@ -1,6 +1,29 @@
 # TODOS
 
-## v0.41.19.0 status + doctor-categories wave follow-ups (v0.42+)
+## v0.41.21.0 ops-fix-wave follow-ups (v0.41.22+)
+
+- **TODO-OPS-1 (P2)**: `gbrain sync print-cron` subcommand. Print the canonical
+  cron line based on the active source set: `gbrain sync --all --parallel N
+  --workers N --skip-failed` where N defaults to `min(sourceCount, 4)`. Reads
+  `sources` table for active (non-archived, `local_path IS NOT NULL`) entries.
+  Ergonomic upgrade over the v0.41.19.0 `sync_consolidation` doctor message —
+  operator pipes directly into `crontab -e` instead of copy-paste-massage.
+  ~80 LOC. Mirrors `gbrain sync --break-lock` argv shape.
+
+- **TODO-OPS-2 (P2)**: Lock-loss detection — extend `DbLockHandle.refresh()`
+  to throw `LockLostError` on 0 rows affected. Codex caught during the
+  v0.41.19.0 plan review: `refresh()` runs `UPDATE ... WHERE holder_pid = pid`
+  with no rows-affected check (`db-lock.ts:108-114`, `:151-156`). If the
+  TTL expired and another worker took over, the original keeps writing
+  silently. v0.41.19.0 ships TTL=5min + active in-phase refresh via
+  `buildYieldDuringPhase` which makes the race window much narrower, but
+  an `await chat()` call that exceeds the 5min wallclock window can still
+  hit it. Fix: `RETURNING id` on the UPDATE + check `rows.length === 0` →
+  throw tagged `LockLostError`. Phases catch + abort cleanly (write partial
+  progress, return `status: 'fail'` with reason `'lock_lost'`). Behavioral
+  contract change with phase-abort fallout; needs its own design pass.
+
+## v0.41.20.0 status + doctor-categories wave follow-ups (v0.42+)
 
 - **TODO-V19-A (P3)**: Persistent `cycle_runs` table. v0.41.19.0 infers
   "last full cycle" by querying `minion_jobs WHERE name = 'autopilot-cycle'`

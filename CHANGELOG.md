@@ -2,6 +2,179 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.21.0] - 2026-05-27
+
+**Five daily-driver ops pains, fixed in one wave. Your big brains stop
+silently wedging, you can see what the cycle is doing instead of
+guessing, and the 10-hour mention scan now resumes instead of restarting
+from zero.**
+
+If you run a 100K+ page brain you probably hit at least three of these
+this week. The cycle hung for ten minutes printing nothing, so you
+checked the database manually to see if it was alive. A worker crashed
+mid-phase and the lock held for 30 minutes before another worker could
+take over, so you cleared it by hand. Your mention scan died at 87% and
+you had to restart it from page 0. Your cron ran two separate sync
+entries because you didn't know `sync --all --parallel` existed. And the
+extract_atoms phase burned 5 to 10 minutes per cycle on a sequence of
+7,000 SQL roundtrips before it even started extracting anything. All five
+get fixed in this release.
+
+## To take advantage of v0.41.21.0
+
+`gbrain upgrade` should pick this up automatically. Migration v104 adds a
+partial expression index on `pages.frontmatter->>'source_hash'` for atom
+rows. On Postgres it builds with `CREATE INDEX CONCURRENTLY` so no
+table-level lock; PGLite uses plain `CREATE INDEX`. On a 100K-page brain
+the index takes seconds to build.
+
+1. **Confirm the migration applied:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name=="schema_version")'
+   ```
+2. **Confirm extract_atoms got fast:**
+   ```bash
+   time gbrain dream --phase extract_atoms --dry-run --json
+   ```
+   The idempotency check phase should finish in under a second instead
+   of taking 5 to 10 minutes.
+3. **Multi-source brains: pick up the new doctor nudge:**
+   ```bash
+   gbrain doctor --json | jq '.checks[] | select(.name=="sync_consolidation")'
+   ```
+   You'll see the paste-ready cron line for `sync --all --parallel`.
+
+If any step fails or the numbers look wrong, file an issue at
+https://github.com/garrytan/gbrain/issues with the output of `gbrain
+doctor` and `~/.gbrain/upgrade-errors.jsonl` if it exists.
+
+### What you'd see in a concrete example
+
+| Pain | Before | After |
+|---|---|---|
+| `extract_atoms` startup on 7K transcripts | 5-10 min of silent overhead | <1 s, then real work |
+| `extract_atoms` mid-run feedback | "start" then silence for 10+ min | tick every ~1s with running atom count |
+| `synthesize_concepts` mid-run feedback | "start" then silence | tick every ~1s with concept count |
+| Crashed cycle lock recovery | 30 min wait, often manual `gbrain sync --break-lock` | <5 min, no manual intervention |
+| `by-mention` resume after kill at 87% | re-scan 280K of 322K pages | resume from where you stopped |
+| Multi-source cron setup | two staggered per-source entries | one `sync --all --parallel 4` line |
+
+### Things to watch
+
+- **Lock TTL behavior changed (30 min → 5 min).** Cron-side
+  `gbrain sync --break-lock --max-age 1800` scripts that assumed the
+  old 30-min TTL still work, but the number is now larger than the
+  default TTL itself. Anyone who explicitly set `--max-age` against the
+  old TTL should drop the value to match the new shorter window.
+- **`by-mention --dry-run` no longer claims to be resumable.** Dry-run
+  intentionally skips both the checkpoint load and write so it stays an
+  inspection mode. To exercise the resume path you'll need a real run.
+- **One residual silent-failure window** under the new shorter TTL: if
+  a single `await chat()` call sits past 5 min wallclock, the lock can
+  expire mid-await without the original phase noticing. This is the
+  same silent-overwrite risk that existed before the wave, just on a
+  shorter timescale. Lock-loss detection is filed as a P2 follow-up
+  TODO (`DbLockHandle.refresh()` will throw on 0 rows affected, phases
+  catch + abort cleanly).
+
+### Itemized changes
+
+#### Added
+- `atomsExistingForHashes(engine, sourceId, hashes[])` exported from
+  `src/core/cycle/extract-atoms.ts` — one batched SQL roundtrip that
+  returns the set of `content_hash16` values already extracted as atoms
+  for this source. Replaces the prior per-hash loop that did 7K
+  individual queries on big brains. Fail-open: an SQL error logs to
+  stderr and returns an empty set so extraction proceeds.
+- `progress?: ProgressReporter` opt on `ExtractAtomsOpts` and
+  `SynthesizeConceptsOpts`. Cycle.ts now passes its phase-level reporter
+  down (NOT a child reporter — that would produce a path collision
+  `cycle.extract_atoms.extract_atoms.work`). Phases only call `tick()`
+  and `heartbeat()`; cycle.ts owns `start()` and `finish()`. You see
+  `[cycle.extract_atoms] N (atoms_created)` ticks every ~1s during both
+  long phases.
+- `yieldDuringPhase?: () => Promise<void>` opt on `ExtractAtomsOpts`
+  (and `synthesize_concepts` finally wires the existing one).
+  Cycle.ts builds a `buildYieldDuringPhase(lock, outer)` closure
+  (also exported for tests) that calls `lock.refresh()` AND any
+  external hook on every fire. Throttled to 30s inside each phase via
+  `maybeYield`. Fires both inside the main work loop AND immediately
+  after every `await chat(...)` LLM call so long Haiku/Sonnet calls
+  don't sit past TTL.
+- `mentionsFingerprint({source, type, since, gazetteerHash})` in
+  `src/core/op-checkpoint.ts`. The gazetteer hash is the load-bearing
+  field — adding new entity pages mid-pause shifts the hash, gets a
+  new fingerprint, and triggers a fresh scan against the new gazetteer
+  instead of silently skipping previously-scanned pages.
+- `gbrain extract links --by-mention` now resumes from where it died.
+  Wired through the existing `op_checkpoints` framework with a
+  `flushAndCheckpoint` ordering — links flush to the DB FIRST, page
+  keys commit to the checkpoint SECOND, persist THIRD. A crash between
+  `batch.push()` and the flush leaves the page un-checkpointed so
+  resume re-scans it. Persist cadence: every 1000 items OR every 30s,
+  whichever first. Clean exit clears the checkpoint.
+- `sync_consolidation` doctor check. Multi-source brains see a
+  paste-ready `gbrain sync --all --parallel 4 --workers 4
+  --skip-failed` recommendation. Single-source brains get
+  "not applicable." SQL errors return `warn` via the check's own
+  try/catch — outer doctor catch isn't a safe assumption.
+- "Multi-source brains" recipe block in
+  `skills/cron-scheduler/SKILL.md` documenting the `sync --all`
+  pattern as preferred over per-source entries.
+- Migration v104 `pages_atom_source_hash_idx` — partial expression
+  index on `frontmatter->>'source_hash'` for atom rows where
+  `deleted_at IS NULL`. Postgres uses `CREATE INDEX CONCURRENTLY` with
+  invalid-remnant pre-drop (mirrors v97 `pages_dedup_partial_index`);
+  PGLite uses plain `CREATE INDEX`. Without this, the new batch
+  idempotency check would seq-scan the pages table on big brains and
+  defeat the perf win.
+
+#### Changed
+- Cycle lock TTL dropped from 30 min to 5 min
+  (`src/core/cycle.ts:LOCK_TTL_MINUTES`). Combined with active
+  in-phase `lock.refresh()` via `buildYieldDuringPhase`, a healthy
+  long-running cycle keeps the lock alive while a crashed cycle
+  releases it 6x faster.
+- `synthesize_concepts` no longer fires `yieldDuringPhase` per-concept-
+  group. Same hook, throttled to 30s via the new shared `maybeYield`
+  helper — matches the actual lock-refresh budget instead of spamming
+  hundreds of redundant fires per phase.
+
+#### Fixed
+- The 7K-roundtrip overhead at the start of every `extract_atoms` cycle
+  on brains with conversation-transcript corpora.
+- The 30-min wait after a crashed cycle before another worker could
+  acquire the lock.
+- The 10+ hour `by-mention` sweep restarting from page 0 every time it
+  got interrupted.
+- Two correctness bugs in the original by-mention checkpoint design
+  that the codex review caught before merge: lost links if a crash
+  landed between `batch.push()` and `flush()`, and silent-miss-on-new-
+  entities if the gazetteer changed between paused runs. The fix
+  flushes links before committing the checkpoint and folds the
+  gazetteer hash into the fingerprint.
+- Multi-source brains seeing two separate cron entries with manual
+  staggering instead of one `sync --all --parallel` line.
+
+### For contributors
+
+- 44 new unit/PGLite tests across 9 files pinning every contract:
+  - `test/cycle/extract-atoms-batch.test.ts` (5 cases) — batch idempotency
+  - `test/cycle/cycle-lock-ttl.test.ts` (1 case) — regression pin on `LOCK_TTL_MINUTES === 5`
+  - `test/op-checkpoint-mentions-fingerprint.test.ts` (7 cases) — fingerprint sensitivity including gazetteer-hash regression guard
+  - `test/cycle/extract-atoms-progress.test.ts` (4 cases) — phase doesn't call start/finish, ticks fire per item
+  - `test/cycle/synthesize-concepts-progress.test.ts` (3 cases) — same shape
+  - `test/cycle/yield-during-phase-refresh.test.ts` (7 cases) — buildYieldDuringPhase actually calls lock.refresh() + outer hook, throws non-fatal
+  - `test/cycle/yield-during-phase-throttle.test.ts` (3 cases) — 30s throttle gate behavior
+  - `test/extract-by-mention-resume.test.ts` (5 cases) — checkpoint persistence ordering, dry-run skips persist, gazetteer change invalidates, filtered pages get checkpointed
+  - `test/doctor-sync-consolidation.test.ts` (6 cases) — edge case matrix for source counts + archived filtering + SQL error path
+- `LockHandle` and `buildYieldDuringPhase` exported from
+  `src/core/cycle.ts` for test seam access.
+- Two new follow-up TODOs filed in `TODOS.md` under
+  "v0.41.21.0 ops-fix-wave follow-ups": `gbrain sync print-cron`
+  subcommand and lock-loss detection (extending
+  `DbLockHandle.refresh()` to throw on 0 rows affected).
+
 ## [0.41.20.0] - 2026-05-26
 
 **One command tells you if your brain is healthy. And `gbrain doctor`
