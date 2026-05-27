@@ -119,12 +119,6 @@ export const ALL_PHASES: CyclePhase[] = [
   // BATCH_SIZE*10 chunks where edges_backfilled_at IS NULL or stale.
   'resolve_symbol_edges',
   'patterns',
-  // v0.41.20.0 SkillOpt — self-evolving skills phase. Runs AFTER patterns
-  // (graph-fresh) so any skill that depends on cross-session themes gets
-  // optimized against the freshest state. Default OFF; opt-in via
-  // `gbrain config set cycle.skillopt.enabled true`. Bundled-skill safety
-  // (D16): never auto-mutates bundled skills.
-  'skillopt',
   // v0.41 T9 — concept synthesis (global, pack-gated). Runs AFTER patterns
   // so the cluster pass sees fresh cross-session themes. Same pack-gate
   // model as extract_atoms.
@@ -158,6 +152,18 @@ export const ALL_PHASES: CyclePhase[] = [
   // block placement, which runs between the calibration trio and embed),
   // and BEFORE embed so newly-inserted facts get embedded same-cycle.
   'conversation_facts_backfill',
+  // v0.41.20.0 SkillOpt — self-evolving skills phase. Dispatch order
+  // places it AFTER the main graph-mutating cluster (extract, patterns,
+  // consolidate, calibration, conversation-facts) so any skill that
+  // depends on cross-session themes gets optimized against the freshest
+  // state — strictly fresher than "right after patterns" since downstream
+  // phases also mutate state the optimizer reads. Default OFF; opt-in via
+  // `gbrain config set cycle.skillopt.enabled true`. Bundled-skill safety
+  // (D16): never auto-mutates bundled skills. Position MUST match the
+  // dispatch block in runCycle (see line ~1912) — pinned by the
+  // `report.phases.map(p => p.phase)).toEqual(ALL_PHASES)` assertion in
+  // test/core/cycle.serial.test.ts.
+  'skillopt',
   'embed',
   'orphans',
   // v0.39 T12: passive schema-suggest. Runs LATE so post-sync brain state
