@@ -15,6 +15,9 @@
  */
 
 import { describe, test, expect, beforeAll, afterAll, beforeEach, spyOn } from 'bun:test';
+import { mkdtempSync, rmSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
 import { PGLiteEngine } from '../src/core/pglite-engine.ts';
 import { runDream } from '../src/commands/dream.ts';
 import { runCycle } from '../src/core/cycle.ts';
@@ -132,6 +135,32 @@ describe('runDream — A1 per-source scope (no checkout)', () => {
     expect(rows.length).toBe(1);
     expect(rows[0].source_id).toBe('repo-a'); // NOT 'default' (the A1 bug)
     expect(rows[0].fact).toBe('Founded Acme');
+  });
+
+  test('--source repo-a (no checkout) does NOT borrow the global sync.repo_path of a different source', async () => {
+    // codex P1 regression: with --source set but that source having no on-disk
+    // checkout, resolveBrainDir must return null (DB-only) and NOT fall through
+    // to the global sync.repo_path — otherwise FS phases run against the default
+    // brain's checkout while DB phases + the freshness stamp target repo-a.
+    const globalRepo = mkdtempSync(join(tmpdir(), 'gbrain-global-repo-'));
+    try {
+      await engine.setConfig('sync.repo_path', globalRepo); // exists on disk
+      await engine.executeRaw(
+        `INSERT INTO sources (id, name, local_path, config, created_at)
+         VALUES ('repo-a', 'repo-a', NULL, '{}'::jsonb, NOW()) ON CONFLICT (id) DO NOTHING`,
+        [],
+      );
+      const report = await runDream(engine, ['--source', 'repo-a', '--phase', 'lint', '--json']);
+      expect(report).toBeTruthy();
+      if (!report) return;
+      // brain_dir must be null — NOT the globalRepo path.
+      expect(report.brain_dir).toBeNull();
+      const lint = report.phases.find((p: any) => p.phase === 'lint');
+      expect(lint?.status).toBe('skipped');
+      expect(lint?.details?.reason).toBe('no_brain_dir');
+    } finally {
+      rmSync(globalRepo, { recursive: true, force: true });
+    }
   });
 });
 

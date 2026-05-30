@@ -1530,9 +1530,14 @@ export async function registerBuiltinHandlers(worker: MinionWorker, engine: Brai
   // the single source of truth for phase semantics.
   const makePhaseHandler = (phase: string) => async (job: any) => {
     const { runCycle } = await import('../core/cycle.ts');
-    const repoPath = typeof job.data.repoPath === 'string'
+    // v0.41.38 (codex P2 review): fall back to null (NOT cwd '.') when no repo
+    // is configured, matching the autopilot-cycle handler + `gbrain dream`. On a
+    // checkout-less postgres brain a filesystem phase (synthesize/patterns/...)
+    // skips with reason 'no_brain_dir' instead of running against the worker cwd;
+    // DB-only phases (resolve_symbol_edges/embed/...) ignore brainDir either way.
+    const repoPath: string | null = typeof job.data.repoPath === 'string'
       ? job.data.repoPath
-      : ((await engine.getConfig('sync.repo_path')) ?? '.');
+      : ((await engine.getConfig('sync.repo_path')) ?? null);
     const report = await runCycle(engine, {
       brainDir: repoPath,
       phases: [phase as any],

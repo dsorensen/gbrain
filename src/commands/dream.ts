@@ -235,6 +235,13 @@ async function resolveBrainDir(
     if (src?.local_path && existsSync(src.local_path)) {
       return resolve(src.local_path);
     }
+    // Explicit --source whose checkout isn't on disk → DB-only (skip FS phases).
+    // Do NOT fall through to the global sync.repo_path below: that path belongs
+    // to the default/unscoped brain, and running FS phases (sync/lint/extract)
+    // against it while the DB phases AND the last_full_cycle_at stamp target
+    // <resolvedSourceId> would mix scopes — syncing one source's checkout while
+    // marking a different source fresh. (codex P1 review finding.)
+    return null;
   }
 
   if (engine) {
