@@ -2,6 +2,57 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.41.26.2] - 2026-06-01
+
+**The instructions file agents load on every gbrain session got 86% smaller.**
+
+`CLAUDE.md` is the always-loaded context file for any agent (or human) working
+on the gbrain repo. It had grown to roughly 487KB by accreting a per-version
+note for nearly every file and feature, so every session paid that cost up
+front before doing any real work. This release moves the reference material
+(the full per-file contract registry, the per-test inventory, and the release
+process machinery) into dedicated docs under `docs/`, and keeps `CLAUDE.md`
+focused on the orientation and cross-cutting rules an agent needs on every
+task. Nothing was deleted. Everything that moved is preserved verbatim in
+`docs/` and in git history, and `CLAUDE.md` points to each doc.
+
+This is a developer-experience change for people working on gbrain. It does
+not change any `gbrain` command, the database schema, or anything an end user
+runs.
+
+| File | Before | After |
+|---|---|---|
+| `CLAUDE.md` | ~487 KB | ~66 KB (86% smaller, roughly 105K fewer tokens per session) |
+| `llms-full.txt` | ~496 KB | ~224 KB |
+
+No upgrade action needed. This release has no schema migration and no
+user-facing behavior change, so there is no "To take advantage" step.
+
+### Itemized changes
+
+- `CLAUDE.md` condensed from 31 sections to 15. Kept inline: the architecture
+  overview, a terse "key files" spine map, Commands, the Testing command tiers
+  and isolation rules, Search Mode, Skills, the privacy and
+  responsible-disclosure guardrails, and Skill routing.
+- New `docs/architecture/key-files.md` holds the full per-file contract
+  reference (every module with its exports, flags, and invariants), plus the
+  former thin-client, calibration, and schema-pack "key files cluster"
+  sections.
+- New `docs/architecture/key-files-history.md` preserves the original verbose
+  Key files section verbatim (per-version annotations, PR numbers, decision
+  tags) as a historical record.
+- New `docs/RELEASE_PROCESS.md` holds the release machinery: version-bump
+  locations, the CHANGELOG voice and release-summary format, the
+  "To take advantage" block, version-migration authoring, branch-name and
+  pre/post-ship rules, GitHub Actions SHA maintenance, PR-description rules,
+  the community-PR wave process, and schema-state tracking. The `/ship` and
+  `/document-release` skills read it.
+- New `docs/testing.md` holds the full per-test inventory (every unit and E2E
+  file and what it pins). The Testing section of `CLAUDE.md` keeps the command
+  tiers, isolation lint rules, canonical PGLite test block, the "run E2E
+  without asking" rule, and the E2E DB lifecycle.
+- `llms-full.txt` regenerated from the trimmed `CLAUDE.md`.
+
 ## [0.41.26.1] - 2026-05-27
 
 **Your worker daemon stops crashing 39 times a day.**
