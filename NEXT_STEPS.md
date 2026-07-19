@@ -106,7 +106,35 @@ Its sibling `brain-durability-hook.serial.test.ts` is the inverse and worth a
 glance: it *fails* with the guards off and *passes* with them on, which suggests
 it was quietly depending on the developer's real `~/.gbrain`.
 
-### 7. Repo hygiene
+### 7. Unexplained: `GBRAIN_HOME` and `HOME` are not interchangeable
+
+`configDir()` should resolve `GBRAIN_HOME=$T` and `HOME=$T` (with `GBRAIN_HOME`
+unset) to the same `$T/.gbrain`. Empirically the CLI does not behave the same:
+
+```
+mkdir -p $T/.gbrain/migrations
+echo '{"version":"0.11.0","status":"partial"}' > $T/.gbrain/migrations/completed.jsonl
+
+HOME=$T                  bun run src/cli.ts skillpack-check --quiet   # exit 1 — detects it
+HOME=$T GBRAIN_HOME=$T   bun run src/cli.ts skillpack-check --quiet   # exit 0 — misses it
+```
+
+Same for `doctor`'s half-migrated Minions detection and `init --migrate-only`.
+Not chased down here. It is **not** in `apply-migrations --list` — that layer
+reports identically under both — so the divergence is somewhere in the doctor
+path `skillpack-check` wraps.
+
+Why it matters beyond tests: `GBRAIN_HOME` is the documented way to point gbrain
+at a non-default brain, so if half-migration detection silently no-ops under it,
+real multi-brain users get a false healthy.
+
+The three affected suites (`skillpack-check`, `doctor-minions-check`,
+`init-migrate-only`) now `delete env.GBRAIN_HOME` from their subprocess env,
+which restores exactly their pre-existing behavior. That is a deliberate
+work-around, not a fix — when the underlying difference is resolved, those
+deletes should become unnecessary.
+
+### 8. Repo hygiene
 
 - **Untracked planning docs at the repo root**, deliberately kept out of both
   PRs: `GBRAIN_COMPARISONS_PERPLEXITY.md`, `GBRAIN_MIGRATION_PLAN.md`,
