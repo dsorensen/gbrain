@@ -22,10 +22,23 @@ stalled job" log lines under heavy queue load, they stop after upgrading.
   (The TODO's original location reference pointed at `src/worker.ts:269`, a path
   that no longer exists; the real site was found and fixed.)
 
+- **Local test runs no longer inherit repo-root `.env` credentials.** Bun
+  auto-loads `<repo-root>/.env` into every process it spawns, including
+  `bun test`. On a developer machine that file holds real keys, so tests that
+  gate on a credential being *absent* stopped skipping and took real-network
+  paths, and credential-preflight assertions that should fail loudly exited 0.
+  A new preload (`test/helpers/dotenv-guard-preload.ts`, wired first in
+  `bunfig.toml`) deletes exactly the variables whose value matches the `.env`
+  file's, so shell-exported values survive and CI — which has no `.env` — is a
+  pure no-op. Set `GBRAIN_ALLOW_REPO_DOTENV=1` to opt back in.
+
 ### Testing
 
 - `test/worker-stall-detector-guard.test.ts` — pins the guard against overlapping
   ticks and error-path recovery.
+- `test/dotenv-guard.test.ts` — 13 tests covering `.env` parsing (quotes, inline
+  comments, `export` prefix, `=` in values) and value-equality scrubbing, plus a
+  wiring check asserting the running test process holds none of the file's values.
 - `test/core/db-singleton.serial.test.ts` — 7 fast-tier tests covering the
   connection singleton state machine (pre-connect throw, missing `database_url`,
   owner vs joiner returns, same-url vs different-url second connect, disconnect,
