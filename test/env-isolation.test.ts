@@ -1,15 +1,18 @@
 /**
- * Pins `test/helpers/dotenv-guard-preload.ts` — the guard that stops the
- * repo-root `.env` from leaking real credentials into test processes.
+ * Pins `test/helpers/env-isolation-preload.ts` — the guard that stops
+ * developer-machine state from leaking into test processes.
  *
- * Background: Bun auto-loads `<repo-root>/.env` into every process it spawns.
- * On a developer machine that file holds real keys, so tests that gate on a
- * credential being absent stop skipping and take real-network paths, while CI
- * (no `.env`) behaves differently. The guard deletes exactly the vars whose
- * value matches the file's, leaving shell-exported values alone.
+ * Two leaks, same class: the repo-root `.env` (real credentials, auto-loaded
+ * by Bun into everything it spawns) and the real `~/.gbrain` (the live brain
+ * config `configDir()` falls back to when `GBRAIN_HOME` is unset). Neither
+ * exists in CI, so both make local runs assert against different inputs.
  */
 import { describe, expect, test } from 'bun:test';
-import { parseDotenv, scrubDotenvValues } from './helpers/dotenv-guard-preload.ts';
+import {
+  isolateGbrainHome,
+  parseDotenv,
+  scrubDotenvValues,
+} from './helpers/env-isolation-preload.ts';
 
 describe('parseDotenv', () => {
   test('parses plain KEY=value pairs', () => {
@@ -101,7 +104,55 @@ describe('scrubDotenvValues', () => {
   });
 });
 
+describe('isolateGbrainHome', () => {
+  test('claims a temp dir when GBRAIN_HOME is unset', () => {
+    const env: Record<string, string | undefined> = {};
+    const claimed = isolateGbrainHome(env, () => '/tmp/fake-home');
+
+    expect(claimed).toBe('/tmp/fake-home');
+    expect(env.GBRAIN_HOME).toBe('/tmp/fake-home');
+  });
+
+  test('leaves a caller-provided GBRAIN_HOME alone', () => {
+    const env: Record<string, string | undefined> = { GBRAIN_HOME: '/caller/choice' };
+    let called = false;
+    const claimed = isolateGbrainHome(env, () => {
+      called = true;
+      return '/tmp/fake-home';
+    });
+
+    expect(claimed).toBeNull();
+    expect(env.GBRAIN_HOME).toBe('/caller/choice');
+    expect(called).toBe(false);
+  });
+
+  test('respects an empty-string GBRAIN_HOME as caller-provided', () => {
+    const env: Record<string, string | undefined> = { GBRAIN_HOME: '' };
+    expect(isolateGbrainHome(env, () => '/tmp/fake-home')).toBeNull();
+    expect(env.GBRAIN_HOME).toBe('');
+  });
+
+  test('opts out under GBRAIN_ALLOW_REAL_HOME=1', () => {
+    const env: Record<string, string | undefined> = { GBRAIN_ALLOW_REAL_HOME: '1' };
+    expect(isolateGbrainHome(env, () => '/tmp/fake-home')).toBeNull();
+    expect(env.GBRAIN_HOME).toBeUndefined();
+  });
+});
+
 describe('preload wiring', () => {
+  test('GBRAIN_HOME does not resolve to the real home directory', async () => {
+    const { homedir } = await import('node:os');
+    const { join } = await import('node:path');
+
+    // configDir() appends '.gbrain' to GBRAIN_HOME, so the leak this guards
+    // against is GBRAIN_HOME being unset (fallback to homedir()/.gbrain).
+    expect(process.env.GBRAIN_HOME).toBeDefined();
+    expect(process.env.GBRAIN_HOME).not.toBe(homedir());
+
+    const { configDir } = await import('../src/core/config.ts');
+    expect(configDir()).not.toBe(join(homedir(), '.gbrain'));
+  });
+
   test('the running test process has no repo-root .env credentials', async () => {
     const { existsSync, readFileSync } = await import('node:fs');
     const { join } = await import('node:path');

@@ -22,23 +22,33 @@ stalled job" log lines under heavy queue load, they stop after upgrading.
   (The TODO's original location reference pointed at `src/worker.ts:269`, a path
   that no longer exists; the real site was found and fixed.)
 
-- **Local test runs no longer inherit repo-root `.env` credentials.** Bun
-  auto-loads `<repo-root>/.env` into every process it spawns, including
-  `bun test`. On a developer machine that file holds real keys, so tests that
-  gate on a credential being *absent* stopped skipping and took real-network
-  paths, and credential-preflight assertions that should fail loudly exited 0.
-  A new preload (`test/helpers/dotenv-guard-preload.ts`, wired first in
-  `bunfig.toml`) deletes exactly the variables whose value matches the `.env`
-  file's, so shell-exported values survive and CI — which has no `.env` — is a
-  pure no-op. Set `GBRAIN_ALLOW_REPO_DOTENV=1` to opt back in.
+- **Test runs are hermetic against developer-machine state.** Two things that
+  exist on a developer box but never in CI were silently changing what the
+  suite tested. A new preload (`test/helpers/env-isolation-preload.ts`, wired
+  first in `bunfig.toml`) closes both:
+  - *Repo-root `.env`.* Bun auto-loads it into every process it spawns,
+    including `bun test`, so tests that gate on a credential being *absent*
+    stopped skipping and took real-network paths, and credential-preflight
+    assertions that should fail loudly exited 0. The preload deletes exactly
+    the variables whose value matches the file's, so shell-exported values
+    survive and CI is a pure no-op. Opt out with `GBRAIN_ALLOW_REPO_DOTENV=1`.
+  - *The real `~/.gbrain`.* With `GBRAIN_HOME` unset, `configDir()` falls back
+    to the developer's live brain config — engine, search mode, embedding
+    model, boosts — while CI resolves to defaults. The preload points
+    `GBRAIN_HOME` at a fresh per-process temp dir when the caller left it
+    unset. This fixed 10 tests across `hybrid-reranker-integration`,
+    `autocut-integration`, `llm-intent-hybrid-integration` and
+    `unified-multimodal` that failed locally and passed in CI. Opt out with
+    `GBRAIN_ALLOW_REAL_HOME=1`.
 
 ### Testing
 
 - `test/worker-stall-detector-guard.test.ts` — pins the guard against overlapping
   ticks and error-path recovery.
-- `test/dotenv-guard.test.ts` — 13 tests covering `.env` parsing (quotes, inline
-  comments, `export` prefix, `=` in values) and value-equality scrubbing, plus a
-  wiring check asserting the running test process holds none of the file's values.
+- `test/env-isolation.test.ts` — covers `.env` parsing (quotes, inline comments,
+  `export` prefix, `=` in values), value-equality scrubbing, and `GBRAIN_HOME`
+  claiming, plus wiring checks asserting the running test process holds none of
+  the file's values and does not resolve to the real home.
 - `test/core/db-singleton.serial.test.ts` — 7 fast-tier tests covering the
   connection singleton state machine (pre-connect throw, missing `database_url`,
   owner vs joiner returns, same-url vs different-url second connect, disconnect,
