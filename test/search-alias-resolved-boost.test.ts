@@ -89,7 +89,7 @@ describe('alias_resolved boost stage', () => {
 });
 
 describe('KNOBS_HASH_VERSION', () => {
-  it('is 12 (11→12 hard-exclude fold invalidates rows written under a different exclude policy, #2825)', () => {
-    expect(KNOBS_HASH_VERSION).toBe(12);
+  it('is 13 (12→13 source-boost map fold so a search.source_boosts config change cannot serve pre-change rankings, v0.42.63)', () => {
+    expect(KNOBS_HASH_VERSION).toBe(13);
   });
 });
