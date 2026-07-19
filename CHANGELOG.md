@@ -45,6 +45,11 @@ stalled job" log lines under heavy queue load, they stop after upgrading.
 
 - `test/worker-stall-detector-guard.test.ts` — pins the guard against overlapping
   ticks and error-path recovery.
+- `test/core/cycle.serial.test.ts` — the engine-null lock test now derives its
+  path from `gbrainPath('cycle.lock')`, matching how `cycle.ts` builds it,
+  instead of a hardcoded `homedir()` join that bypassed the `GBRAIN_HOME`
+  override. Same hermeticity rule `test/gbrain-home-isolation.test.ts` enforces
+  for write-side callers.
 - `test/env-isolation.test.ts` — covers `.env` parsing (quotes, inline comments,
   `export` prefix, `=` in values), value-equality scrubbing, and `GBRAIN_HOME`
   claiming, plus wiring checks asserting the running test process holds none of
