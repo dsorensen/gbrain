@@ -148,6 +148,66 @@ export interface MinionWorker {
   emit(event: 'unhealthy', info: UnhealthyReason): boolean;
 }
 
+/**
+ * Stall-detector tick body. Extracted from the `setInterval` callback
+ * (TODO-LR-4) so `createStalledDetectorTick`'s re-entrancy guard can wrap
+ * it AND so a test can drive it without a live engine/DB. Behavior is
+ * unchanged from the pre-guard inline body: three independent try/catch
+ * blocks so one detector's failure doesn't block the others.
+ */
+export async function runStalledDetectorTick(
+  queue: Pick<MinionQueue, 'handleStalled' | 'handleTimeouts' | 'handleWallClockTimeouts'>,
+  lockDuration: number,
+): Promise<void> {
+  try {
+    const { requeued, dead } = await queue.handleStalled();
+    if (requeued.length > 0) console.log(`Stall detector: requeued ${requeued.length} jobs`);
+    if (dead.length > 0) console.log(`Stall detector: dead-lettered ${dead.length} jobs`);
+  } catch (e) {
+    console.error('Stall detection error:', e instanceof Error ? e.message : String(e));
+  }
+  try {
+    const timedOut = await queue.handleTimeouts();
+    if (timedOut.length > 0) console.log(`Timeout detector: dead-lettered ${timedOut.length} jobs (timeout exceeded)`);
+  } catch (e) {
+    console.error('Timeout detection error:', e instanceof Error ? e.message : String(e));
+  }
+  try {
+    const wallClockTimedOut = await queue.handleWallClockTimeouts(lockDuration);
+    if (wallClockTimedOut.length > 0) {
+      console.log(`Wall-clock detector: dead-lettered ${wallClockTimedOut.length} jobs (wall-clock timeout exceeded)`);
+    }
+  } catch (e) {
+    console.error('Wall-clock timeout detection error:', e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * TODO-LR-4 (P2, codex C13): builds the stall-detector's `setInterval`
+ * callback wrapped in a `tickInFlight` re-entrancy guard — the same
+ * boolean-flag pattern `launchJob`'s lock-renewal timer already uses
+ * below (see its docstring). The stall-detector tick has try/catch on
+ * every await so it never crashes, but it previously lacked this guard,
+ * so during a PgBouncer outage 3 concurrent stall-detector loops could
+ * pile 9 pending connection acquisitions per tick on an already-saturated
+ * pool — amplifying the very stall they're trying to detect. Extracted
+ * to a named function (rather than inlined in `start()`) so a unit test
+ * can call it directly without a live engine/DB.
+ */
+export function createStalledDetectorTick(
+  queue: Pick<MinionQueue, 'handleStalled' | 'handleTimeouts' | 'handleWallClockTimeouts'>,
+  lockDuration: number,
+): () => void {
+  let tickInFlight = false;
+  return () => {
+    if (tickInFlight) return;
+    tickInFlight = true;
+    void runStalledDetectorTick(queue, lockDuration).finally(() => {
+      tickInFlight = false;
+    });
+  };
+}
+
 export class MinionWorker extends EventEmitter {
   private queue: MinionQueue;
   private handlers = new Map<string, MinionHandler>();
@@ -294,29 +354,13 @@ export class MinionWorker extends EventEmitter {
     // Stall + timeout detection on interval. Order matters: handleStalled FIRST
     // so a stalled job (lock_until expired) gets requeued before handleTimeouts'
     // `lock_until > now()` guard would skip it. Stall → retry, timeout → dead.
-    const stalledTimer = setInterval(async () => {
-      try {
-        const { requeued, dead } = await this.queue.handleStalled();
-        if (requeued.length > 0) console.log(`Stall detector: requeued ${requeued.length} jobs`);
-        if (dead.length > 0) console.log(`Stall detector: dead-lettered ${dead.length} jobs`);
-      } catch (e) {
-        console.error('Stall detection error:', e instanceof Error ? e.message : String(e));
-      }
-      try {
-        const timedOut = await this.queue.handleTimeouts();
-        if (timedOut.length > 0) console.log(`Timeout detector: dead-lettered ${timedOut.length} jobs (timeout exceeded)`);
-      } catch (e) {
-        console.error('Timeout detection error:', e instanceof Error ? e.message : String(e));
-      }
-      try {
-        const wallClockTimedOut = await this.queue.handleWallClockTimeouts(this.opts.lockDuration);
-        if (wallClockTimedOut.length > 0) {
-          console.log(`Wall-clock detector: dead-lettered ${wallClockTimedOut.length} jobs (wall-clock timeout exceeded)`);
-        }
-      } catch (e) {
-        console.error('Wall-clock timeout detection error:', e instanceof Error ? e.message : String(e));
-      }
-    }, this.opts.stalledInterval);
+    // TODO-LR-4: tickInFlight-guarded (see createStalledDetectorTick above) so
+    // overlapping ticks during a PgBouncer stall don't pile concurrent
+    // connection acquisitions on an already-saturated pool.
+    const stalledTimer = setInterval(
+      createStalledDetectorTick(this.queue, this.opts.lockDuration),
+      this.opts.stalledInterval,
+    );
 
     // Periodic RSS watchdog — closes the production-freeze regression where
     // all concurrency slots are wedged with zero job completions, so the

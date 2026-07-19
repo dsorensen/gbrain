@@ -1084,7 +1084,7 @@ instrumentation collects.
     Without pruning, lock-renewal audit files accumulate one per
     ISO-week — negligible at first but worth doing the right way.
 
-- **TODO-LR-4 (P2, codex C13): stall-detector re-entrancy guard at
+- [x] **TODO-LR-4 (P2, codex C13): stall-detector re-entrancy guard at
   worker.ts:269.**
   The stall-detector `setInterval(async ...)` block has try/catch on
   every await so it doesn't crash. But it lacks a re-entrancy guard,
@@ -1100,6 +1100,10 @@ instrumentation collects.
   - **Why:** same bug class as the v0.41.22.1 lock-renewal crash, but
     a different symptom. Doesn't crash, does amplify load.
   - **Source:** codex outside-voice review of v0.41.26.1 plan.
+  - **Completed (2026-07-19):** `tickInFlight` guard applied at the real
+    site (`src/core/minions/worker.ts`, stall detector's `setInterval`
+    inside `start()`) via `createStalledDetectorTick`/`runStalledDetectorTick`,
+    pinned by `test/worker-stall-detector-guard.test.ts`.
 
 - **TODO-LR-5 (P3): bare-quoted hostname + username redactor patterns.**
   The v0.41.26.1 `redactConnectionInfo` catches bare `host=`,
