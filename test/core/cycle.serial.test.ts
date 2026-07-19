@@ -289,7 +289,10 @@ describe('runCycle — cycle_already_running skip', () => {
 // ─── Engine null path ─────────────────────────────────────────────
 
 describe('runCycle — engine = null (filesystem-only mode)', () => {
-  const lockFile = require('path').join(require('os').homedir(), '.gbrain', 'cycle.lock');
+  // Must match how cycle.ts builds it (`gbrainPath('cycle.lock')`), NOT a raw
+  // homedir() join — GBRAIN_HOME redirects the real path, so a hardcoded
+  // homedir path looks for the lock somewhere the code never wrote it.
+  const lockFile = require('../../src/core/config.ts').gbrainPath('cycle.lock');
 
   afterEach(() => {
     if (existsSync(lockFile)) { try { unlinkSync(lockFile); } catch { /* */ } }

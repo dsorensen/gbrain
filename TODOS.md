@@ -1043,6 +1043,10 @@ instrumentation collects.
 - [ ] **v0.41.28+: Investigate disconnect-call audit data from production; fix the offending ownership boundary.** v0.41.28.0 ships `src/core/audit/db-disconnect-audit.ts` which records every `db.disconnect()` and `PostgresEngine.disconnect()` call with engine kind, connection style, caller stack, command, and pid. Doctor's `batch_retry_health` check surfaces the 24h count + most-recent caller. After the next user-reported `gbrain dream` cycle with reconnect events, read `~/.gbrain/audit/db-disconnect-YYYY-Www.jsonl` (or the doctor JSON output) and identify the specific code path firing the mid-process disconnect. The fix is then a targeted patch to that ownership boundary (per codex outside-voice finding 4 — "audit/log current callers in dream/facts paths, then change only the offending ownership boundary"). Priority: P1 once data exists; tracked by user feedback on #1570 thread.
 
 - [ ] **v0.42+: Re-evaluate module-singleton removal IF the targeted v0.41.26 fix doesn't close the bug class.** The original v0.41.25 plan proposed removing nullability of `let sql: ReturnType<typeof postgres> | null = null` in `src/core/db.ts:7` and renaming `disconnect → shutdown`. Codex outside-voice review found 15 substantive problems (logical contradiction, wrong cleanup primitive, ~120-site scale estimate fantasy, BrainEngine contract asymmetry, etc.). If the targeted v0.41.26 fix closes #1570 cleanly, this refactor is genuinely unnecessary and can be closed. If new disconnect-class bugs surface in v0.41.28+, this is the design-conversation TODO that re-opens. Architecture conversation point: node-postgres explicitly deprecated the singleton pattern gbrain has — pull this in only when there's evidence we keep paying for it. Priority: P3 (speculative). Plan + findings preserved at `~/.claude/plans/system-instruction-you-are-working-cuddly-panda.md`.
+  - **2026-07-19 review:** reopen-condition unfired (no disconnect-class bugs
+    post-v0.41.28.0 in TODOS/CHANGELOG); refactor stays closed-unless-evidence;
+    fast-tier state-machine coverage added (test/core/db-singleton.serial.test.ts)
+    so any future decision has a verification gate.
 
 ## v0.41.26.1 lock-renewal cathedral follow-ups (v0.42+)
 
@@ -1084,7 +1088,7 @@ instrumentation collects.
     Without pruning, lock-renewal audit files accumulate one per
     ISO-week — negligible at first but worth doing the right way.
 
-- **TODO-LR-4 (P2, codex C13): stall-detector re-entrancy guard at
+- [x] **TODO-LR-4 (P2, codex C13): stall-detector re-entrancy guard at
   worker.ts:269.**
   The stall-detector `setInterval(async ...)` block has try/catch on
   every await so it doesn't crash. But it lacks a re-entrancy guard,
@@ -1100,6 +1104,10 @@ instrumentation collects.
   - **Why:** same bug class as the v0.41.22.1 lock-renewal crash, but
     a different symptom. Doesn't crash, does amplify load.
   - **Source:** codex outside-voice review of v0.41.26.1 plan.
+  - **Completed (2026-07-19):** `tickInFlight` guard applied at the real
+    site (`src/core/minions/worker.ts`, stall detector's `setInterval`
+    inside `start()`) via `createStalledDetectorTick`/`runStalledDetectorTick`,
+    pinned by `test/worker-stall-detector-guard.test.ts`.
 
 - **TODO-LR-5 (P3): bare-quoted hostname + username redactor patterns.**
   The v0.41.26.1 `redactConnectionInfo` catches bare `host=`,

@@ -2,6 +2,64 @@
 
 All notable changes to GBrain will be documented in this file.
 
+## [0.42.63.1] - 2026-07-19
+
+**Background job processing is steadier under load. The worker's stall detector — the sweep that finds jobs whose lock has lapsed and hands them back to the queue — runs on a timer. If one sweep ran long (a slow database, a big backlog), the next tick could start before the previous one finished, so two sweeps raced over the same stalled jobs. The tick now refuses to re-enter while a sweep is still in flight, the same protection the lock-renewal timer already had. Also adds fast-tier test coverage for the database connection singleton's state machine, so future work on it has a verification gate.**
+
+## To take advantage of v0.42.63.1
+
+`gbrain upgrade` should do this automatically. Nothing to configure — the guard is
+unconditional. If you saw duplicated stall-detection work or overlapping "reclaimed
+stalled job" log lines under heavy queue load, they stop after upgrading.
+
+### Fixed
+
+- **Worker stall detector is re-entrancy-safe** (TODO-LR-4). The stall-detector
+  `setInterval` in `src/core/minions/worker.ts` now wraps its tick in the same
+  `tickInFlight` guard `launchJob`'s lock-renewal timer uses, so a slow sweep can
+  no longer overlap the next one. The tick body is extracted to
+  `runStalledDetectorTick` / `createStalledDetectorTick` to make it testable.
+  (The TODO's original location reference pointed at `src/worker.ts:269`, a path
+  that no longer exists; the real site was found and fixed.)
+
+- **Test runs are hermetic against developer-machine state.** Two things that
+  exist on a developer box but never in CI were silently changing what the
+  suite tested. A new preload (`test/helpers/env-isolation-preload.ts`, wired
+  first in `bunfig.toml`) closes both:
+  - *Repo-root `.env`.* Bun auto-loads it into every process it spawns,
+    including `bun test`, so tests that gate on a credential being *absent*
+    stopped skipping and took real-network paths, and credential-preflight
+    assertions that should fail loudly exited 0. The preload deletes exactly
+    the variables whose value matches the file's, so shell-exported values
+    survive and CI is a pure no-op. Opt out with `GBRAIN_ALLOW_REPO_DOTENV=1`.
+  - *The real `~/.gbrain`.* With `GBRAIN_HOME` unset, `configDir()` falls back
+    to the developer's live brain config — engine, search mode, embedding
+    model, boosts — while CI resolves to defaults. The preload points
+    `GBRAIN_HOME` at a fresh per-process temp dir when the caller left it
+    unset. This fixed 10 tests across `hybrid-reranker-integration`,
+    `autocut-integration`, `llm-intent-hybrid-integration` and
+    `unified-multimodal` that failed locally and passed in CI. Opt out with
+    `GBRAIN_ALLOW_REAL_HOME=1`.
+
+### Testing
+
+- `test/worker-stall-detector-guard.test.ts` — pins the guard against overlapping
+  ticks and error-path recovery.
+- `test/core/cycle.serial.test.ts` — the engine-null lock test now derives its
+  path from `gbrainPath('cycle.lock')`, matching how `cycle.ts` builds it,
+  instead of a hardcoded `homedir()` join that bypassed the `GBRAIN_HOME`
+  override. Same hermeticity rule `test/gbrain-home-isolation.test.ts` enforces
+  for write-side callers.
+- `test/env-isolation.test.ts` — covers `.env` parsing (quotes, inline comments,
+  `export` prefix, `=` in values), value-equality scrubbing, and `GBRAIN_HOME`
+  claiming, plus wiring checks asserting the running test process holds none of
+  the file's values and does not resolve to the real home.
+- `test/core/db-singleton.serial.test.ts` — 7 fast-tier tests covering the
+  connection singleton state machine (pre-connect throw, missing `database_url`,
+  owner vs joiner returns, same-url vs different-url second connect, disconnect,
+  reconnect). Serial-tiered because `connect()`'s liveness probe does real I/O,
+  so the suite mocks the `postgres` module at load time.
+
 ## [0.42.63.0] - 2026-07-18
 
 **You can now ask your brain structured questions about what's inside your pages' metadata — and pin down how different kinds of content rank. Every page carries frontmatter fields (status, dates, review deadlines, custom fields), but until now search couldn't see them: there was no way to ask "show me decisions whose review date has passed and still have no recorded outcome." Search, hybrid query, and page listing now accept metadata filters that do exactly that — match a field's value, check that a field exists or is missing, or compare dates. Hybrid query also accepts a list of page types, so you can scope a question to just your people, lessons, and decisions while leaving bulk reference content out. And the ranking weights that decide which shelves of your brain surface first (boost your own writing, demote noisy imports) can now be set once as persistent configuration instead of an environment variable that every process had to remember to carry — with the query cache made change-aware so a ranking change takes effect everywhere immediately.**

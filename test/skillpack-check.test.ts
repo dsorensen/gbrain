@@ -29,6 +29,12 @@ function run(args: string[]): { exitCode: number; stdout: string; stderr: string
   const env = { ...process.env, HOME: tmp } as Record<string, string | undefined>;
   delete env.DATABASE_URL;
   delete env.GBRAIN_DATABASE_URL;
+  // This suite isolates via HOME, and configDir() prefers GBRAIN_HOME over it,
+  // so an inherited GBRAIN_HOME (the test-env isolation preload sets one) would
+  // point the subprocess at a different brain than the fixture below.
+  // Dropping it — rather than setting it to `tmp` — is deliberate: these assertions
+  // only hold on the HOME-fallback path. See NEXT_STEPS.md.
+  delete env.GBRAIN_HOME;
   try {
     const stdout = execFileSync('bun', ['run', CLI, ...args], {
       env: env as Record<string, string>,
